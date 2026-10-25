@@ -96,8 +96,8 @@ def parse_args(argv=None):
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--image-size", type=int, default=320, help="Full-image branch size")
     parser.add_argument(
-        "--local-canvas-size", type=int, default=1024,
-        help="High-resolution local canvas split into four 512x512 patches by default",
+        "--local-canvas-size", type=int, default=640,
+        help="Local canvas split into four 320x320 patches by default",
     )
     parser.add_argument("--feature-dim", type=int, default=128)
     parser.add_argument("--metadata-dim", type=int, default=32)
@@ -124,6 +124,32 @@ def seed_everything(seed):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def calculate_sqrt_pos_weight(csv_path: Path):
+    """Compute Study-level sqrt(negative/positive), clipped to [0.25, 10]."""
+    study_labels = {}
+    with csv_path.open("r", encoding="utf-8-sig", newline="") as handle:
+        for row_number, row in enumerate(csv.DictReader(handle), start=2):
+            key = (row["Subject_id"], row["Study_id"])
+            try:
+                labels = frozenset(int(value) for value in row["Predict_class"].split(";"))
+            except ValueError as exc:
+                raise ValueError(f"row {row_number}: invalid Predict_class") from exc
+            if key in study_labels and study_labels[key] != labels:
+                raise ValueError(f"inconsistent labels for Study key {key}")
+            study_labels[key] = labels
+    positives = torch.zeros(10, dtype=torch.float64)
+    for labels in study_labels.values():
+        for class_id in labels:
+            if not 1 <= class_id <= 10:
+                raise ValueError(f"class ID must be in 1..10, got {class_id}")
+            positives[class_id - 1] += 1
+    negatives = len(study_labels) - positives
+    if (positives == 0).any() or (negatives == 0).any():
+        raise ValueError("every class needs both positive and negative training Studies")
+    weights = torch.sqrt(negatives / positives).clamp(0.25, 10.0).float()
+    return weights, positives.to(torch.int64).tolist(), negatives.to(torch.int64).tolist()
 
 
 def make_optimizer(model, args):
@@ -165,7 +191,7 @@ def optimizer_step(model, optimizer, scaler, accumulated_studies, amp_enabled):
     optimizer.zero_grad(set_to_none=True)
 
 
-def train_epoch(model, loader, optimizer, scheduler, scaler, device, args):
+def train_epoch(model, loader, optimizer, scheduler, scaler, device, args, pos_weight):
     model.train()
     optimizer.zero_grad(set_to_none=True)
     amp_enabled = args.amp and device.type == "cuda"
@@ -176,7 +202,7 @@ def train_epoch(model, loader, optimizer, scheduler, scaler, device, args):
         study_count = int(batch["num_studies"])
         with torch.cuda.amp.autocast(enabled=amp_enabled):
             logits = model(model_batch)["logits"]
-            loss = F.binary_cross_entropy_with_logits(logits, targets)
+            loss = F.binary_cross_entropy_with_logits(logits, targets, pos_weight=pos_weight)
         scaler.scale(loss * study_count).backward()
         total_loss += loss.item() * study_count
         seen_studies += study_count
@@ -225,6 +251,7 @@ def architecture_config(args):
         "metadata_dim": args.metadata_dim,
         "attention_heads": args.attention_heads,
         "dropout": args.dropout,
+        "metadata_inputs": ["ViewPosition", "PatientOrientation"],
     }
 
 
@@ -235,6 +262,9 @@ def save_checkpoint(path, model, optimizer, scheduler, scaler, epoch, best_auc, 
         "epoch": epoch, "optimizer_step": scheduler.last_epoch,
         "best_macro_auc": best_auc, "class_names": list(CLASS_NAMES),
         "preprocessing": preprocessing_config(args), "architecture": architecture_config(args),
+        "pos_weight": args.pos_weight,
+        "label_positives": args.label_positives,
+        "label_negatives": args.label_negatives,
         "config": vars(args) | {"data_root": str(args.data_root), "output_dir": str(args.output_dir),
                                   "resume": str(args.resume) if args.resume else None},
         "torch_rng_state": torch.get_rng_state(), "python_rng_state": random.getstate(),
@@ -244,7 +274,7 @@ def save_checkpoint(path, model, optimizer, scheduler, scaler, epoch, best_auc, 
     torch.save(payload, path)
 
 
-def restore_checkpoint(path, model, optimizer, scheduler, scaler, args):
+def restore_checkpoint(path, model, optimizer, scheduler, scaler, args, pos_weight):
     checkpoint = torch.load(path, map_location="cpu")
     if checkpoint.get("class_names") != list(CLASS_NAMES):
         raise ValueError("checkpoint class order mismatch")
@@ -252,6 +282,9 @@ def restore_checkpoint(path, model, optimizer, scheduler, scaler, args):
         raise ValueError("checkpoint preprocessing differs from current arguments")
     if checkpoint.get("architecture") != architecture_config(args):
         raise ValueError("checkpoint architecture differs from current arguments")
+    saved_pos_weight = checkpoint.get("pos_weight")
+    if saved_pos_weight is None or not torch.allclose(torch.tensor(saved_pos_weight), pos_weight.cpu()):
+        raise ValueError("checkpoint pos_weight differs from current training labels")
     model.load_state_dict(checkpoint["model"])
     optimizer.load_state_dict(checkpoint["optimizer"])
     scheduler.load_state_dict(checkpoint["scheduler"])
@@ -279,6 +312,11 @@ def main(argv=None):
     else:
         run_dir = create_timestamped_run_dir(args.output_dir)
     args.output_dir = run_dir
+    pos_weight, positives, negatives = calculate_sqrt_pos_weight(args.data_root / "train.csv")
+    args.pos_weight = pos_weight.tolist()
+    args.label_positives = positives
+    args.label_negatives = negatives
+    pos_weight = pos_weight.to(device)
     common = dict(image_size=args.image_size, local_canvas_size=args.local_canvas_size,
                   max_images_per_study=args.max_images_per_study)
     train_data = StudyDataset(args.data_root / "train.csv", args.data_root / "train",
@@ -306,14 +344,19 @@ def main(argv=None):
     scaler = torch.cuda.amp.GradScaler(enabled=args.amp and device.type == "cuda")
     start_epoch, best_auc = 1, -math.inf
     if args.resume:
-        start_epoch, best_auc = restore_checkpoint(args.resume, model, optimizer, scheduler, scaler, args)
+        start_epoch, best_auc = restore_checkpoint(
+            args.resume, model, optimizer, scheduler, scaler, args, pos_weight
+        )
     parameter_count = sum(p.numel() for p in model.parameters())
     write_run_config(run_dir, args, device, parameter_count, len(train_data), len(valid_data))
     print(json.dumps({"run_dir": str(run_dir), "device": str(device), "parameters": parameter_count,
-                      "train_studies": len(train_data), "valid_studies": len(valid_data)}))
+                      "train_studies": len(train_data), "valid_studies": len(valid_data),
+                      "pos_weight": args.pos_weight}))
     for epoch in range(start_epoch, args.epochs + 1):
         epoch_started = time.perf_counter()
-        train_loss = train_epoch(model, train_loader, optimizer, scheduler, scaler, device, args)
+        train_loss = train_epoch(
+            model, train_loader, optimizer, scheduler, scaler, device, args, pos_weight
+        )
         metrics = evaluate(model, valid_loader, device, args.amp)
         if math.isfinite(metrics["macro_auc"]) and metrics["macro_auc"] > best_auc:
             best_auc = metrics["macro_auc"]

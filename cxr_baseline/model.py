@@ -59,11 +59,11 @@ class MetadataEncoder(nn.Module):
         super().__init__()
         self.view_embedding = nn.Embedding(len(VIEW_VOCAB), 16)
         self.orientation_embedding = nn.Embedding(len(ORIENTATION_VOCAB), 8)
-        self.network = nn.Sequential(nn.Linear(27, 64), nn.SiLU(), nn.Linear(64, out_dim))
+        self.network = nn.Sequential(nn.Linear(24, 64), nn.SiLU(), nn.Linear(64, out_dim))
 
-    def forward(self, view_ids, orientation_ids, numeric_metadata):
+    def forward(self, view_ids, orientation_ids):
         return self.network(torch.cat((
-            self.view_embedding(view_ids), self.orientation_embedding(orientation_ids), numeric_metadata
+            self.view_embedding(view_ids), self.orientation_embedding(orientation_ids)
         ), dim=-1))
 
 
@@ -124,9 +124,7 @@ class StudyMultiInputNet(nn.Module):
 
         local = self.local_encoder(local_patches.reshape(-1, *local_patches.shape[2:]))
         local = local.view(num_images, 4, self.feature_dim)
-        metadata = self.metadata_encoder(
-            batch["view_ids"], batch["orientation_ids"], batch["numeric_metadata"]
-        )
+        metadata = self.metadata_encoder(batch["view_ids"], batch["orientation_ids"])
         local = local + self.quadrant_embedding.unsqueeze(0) + self.metadata_to_token(metadata).unsqueeze(1)
         tokens, valid_tokens = self._pad_study_tokens(local, image_to_study, num_studies)
 
