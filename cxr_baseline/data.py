@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import math
 import random
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -26,6 +27,8 @@ class ImageRecord:
     path: Path
     view_id: int
     orientation_id: int
+    rows: int
+    columns: int
 
 
 @dataclass
@@ -59,7 +62,7 @@ def read_studies(csv_path, image_root, max_studies=None) -> list[StudyRecord]:
     grouped: OrderedDict[tuple[str, str], StudyRecord] = OrderedDict()
     with csv_path.open("r", encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle)
-        required = {"Dicom_id", "Subject_id", "Study_id"}
+        required = {"Dicom_id", "Subject_id", "Study_id", "Rows", "Columns"}
         missing = required.difference(reader.fieldnames or ())
         if missing:
             raise ValueError(f"{csv_path} is missing columns: {sorted(missing)}")
@@ -86,6 +89,8 @@ def read_studies(csv_path, image_root, max_studies=None) -> list[StudyRecord]:
                 path=path,
                 view_id=VIEW_VOCAB.get(row.get("ViewPosition") or "<UNK>", 0),
                 orientation_id=ORIENTATION_VOCAB.get(row.get("PatientOrientation") or "<UNK>", 0),
+                rows=int(row["Rows"]),
+                columns=int(row["Columns"]),
             ))
     if not grouped:
         raise ValueError(f"no studies found in {csv_path}")
@@ -133,6 +138,15 @@ def load_multiscale_image(path: Path, global_size: int, local_canvas_size: int, 
     return _to_tensor(global_image), local_patches
 
 
+def _numeric_metadata(record: ImageRecord) -> torch.Tensor:
+    """V1 numeric inputs: normalized log height, width, and aspect ratio."""
+    return torch.tensor((
+        math.log(max(record.rows, 1) / 2500.0),
+        math.log(max(record.columns, 1) / 2500.0),
+        math.log(max(record.columns, 1) / max(record.rows, 1)),
+    ), dtype=torch.float32)
+
+
 class StudyDataset(Dataset):
     def __init__(self, csv_path, image_root, image_size=320, local_canvas_size=640,
                  augment=False, max_studies=None, max_images_per_study=None) -> None:
@@ -162,6 +176,7 @@ class StudyDataset(Dataset):
             "local_patches": local_patches,
             "view_ids": [r.view_id for r in image_records],
             "orientation_ids": [r.orientation_id for r in image_records],
+            "numeric_metadata": [_numeric_metadata(r) for r in image_records],
         }
         if record.targets is not None:
             sample["targets"] = record.targets.clone()
@@ -170,19 +185,21 @@ class StudyDataset(Dataset):
 
 def collate_studies(samples: list[dict]) -> dict:
     global_images, local_patches, image_to_study = [], [], []
-    view_ids, orientation_ids = [], []
+    view_ids, orientation_ids, numeric_metadata = [], [], []
     for study_index, sample in enumerate(samples):
         count = len(sample["global_images"])
         global_images.extend(sample["global_images"])
         local_patches.extend(sample["local_patches"])
         view_ids.extend(sample["view_ids"])
         orientation_ids.extend(sample["orientation_ids"])
+        numeric_metadata.extend(sample["numeric_metadata"])
         image_to_study.extend([study_index] * count)
     batch = {
         "global_images": torch.stack(global_images),
         "local_patches": torch.stack(local_patches),
         "view_ids": torch.tensor(view_ids, dtype=torch.long),
         "orientation_ids": torch.tensor(orientation_ids, dtype=torch.long),
+        "numeric_metadata": torch.stack(numeric_metadata),
         "image_to_study": torch.tensor(image_to_study, dtype=torch.long),
         "num_studies": len(samples),
         "subject_ids": [s["subject_id"] for s in samples],

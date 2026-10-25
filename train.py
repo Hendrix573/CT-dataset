@@ -71,7 +71,13 @@ def append_metrics(run_dir: Path, report: dict) -> None:
     csv_row = {
         "time": safe_report["time"], "epoch": safe_report["epoch"],
         "optimizer_step": safe_report["optimizer_step"], "learning_rate": safe_report["learning_rate"],
-        "train_loss": safe_report["train_loss"], "valid_loss": safe_report["loss"],
+        "train_loss": safe_report["train_loss"],
+        "train_eval_loss": safe_report["train_eval_loss"],
+        "train_macro_auc": safe_report["train_macro_auc"],
+        "train_auc_classes": safe_report["train_auc_classes"],
+        "train_macro_ap": safe_report["train_macro_ap"],
+        "train_macro_f1_0.5": safe_report["train_macro_f1_0.5"],
+        "valid_loss": safe_report["loss"],
         "macro_auc": safe_report["macro_auc"], "auc_classes": safe_report["auc_classes"],
         "macro_ap": safe_report["macro_ap"], "macro_f1_0.5": safe_report["macro_f1_0.5"],
         "best_macro_auc": safe_report["best_macro_auc"], "epoch_seconds": safe_report["epoch_seconds"],
@@ -80,6 +86,10 @@ def append_metrics(run_dir: Path, report: dict) -> None:
         csv_row[f"auc_{index}"] = value
     for index, value in enumerate(safe_report["per_class_ap"], start=1):
         csv_row[f"ap_{index}"] = value
+    for index, value in enumerate(safe_report["train_per_class_auc"] or [None] * 10, start=1):
+        csv_row[f"train_auc_{index}"] = value
+    for index, value in enumerate(safe_report["train_per_class_ap"] or [None] * 10, start=1):
+        csv_row[f"train_ap_{index}"] = value
     csv_path = run_dir / "metrics.csv"
     write_header = not csv_path.exists()
     with csv_path.open("a", encoding="utf-8-sig", newline="") as handle:
@@ -102,13 +112,21 @@ def parse_args(argv=None):
     parser.add_argument("--feature-dim", type=int, default=128)
     parser.add_argument("--metadata-dim", type=int, default=32)
     parser.add_argument("--attention-heads", type=int, default=4)
-    parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument(
+        "--local-token-grid", type=int, default=2,
+        help="Spatial token grid retained inside each of the four local patches",
+    )
+    parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--batch-size", type=int, default=1, help="Studies per micro-batch")
     parser.add_argument("--accum-studies", type=int, default=16)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--warmup-epochs", type=float, default=3.0)
+    parser.add_argument(
+        "--train-eval-interval", type=int, default=5,
+        help="Evaluate the augmentation-free training set every N epochs; 0 disables it",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda"))
     parser.add_argument("--amp", action="store_true", help="Use CUDA FP16")
@@ -124,32 +142,6 @@ def seed_everything(seed):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-
-
-def calculate_sqrt_pos_weight(csv_path: Path):
-    """Compute Study-level sqrt(negative/positive), clipped to [0.25, 10]."""
-    study_labels = {}
-    with csv_path.open("r", encoding="utf-8-sig", newline="") as handle:
-        for row_number, row in enumerate(csv.DictReader(handle), start=2):
-            key = (row["Subject_id"], row["Study_id"])
-            try:
-                labels = frozenset(int(value) for value in row["Predict_class"].split(";"))
-            except ValueError as exc:
-                raise ValueError(f"row {row_number}: invalid Predict_class") from exc
-            if key in study_labels and study_labels[key] != labels:
-                raise ValueError(f"inconsistent labels for Study key {key}")
-            study_labels[key] = labels
-    positives = torch.zeros(10, dtype=torch.float64)
-    for labels in study_labels.values():
-        for class_id in labels:
-            if not 1 <= class_id <= 10:
-                raise ValueError(f"class ID must be in 1..10, got {class_id}")
-            positives[class_id - 1] += 1
-    negatives = len(study_labels) - positives
-    if (positives == 0).any() or (negatives == 0).any():
-        raise ValueError("every class needs both positive and negative training Studies")
-    weights = torch.sqrt(negatives / positives).clamp(0.25, 10.0).float()
-    return weights, positives.to(torch.int64).tolist(), negatives.to(torch.int64).tolist()
 
 
 def make_optimizer(model, args):
@@ -191,7 +183,7 @@ def optimizer_step(model, optimizer, scaler, accumulated_studies, amp_enabled):
     optimizer.zero_grad(set_to_none=True)
 
 
-def train_epoch(model, loader, optimizer, scheduler, scaler, device, args, pos_weight):
+def train_epoch(model, loader, optimizer, scheduler, scaler, device, args):
     model.train()
     optimizer.zero_grad(set_to_none=True)
     amp_enabled = args.amp and device.type == "cuda"
@@ -202,7 +194,7 @@ def train_epoch(model, loader, optimizer, scheduler, scaler, device, args, pos_w
         study_count = int(batch["num_studies"])
         with torch.cuda.amp.autocast(enabled=amp_enabled):
             logits = model(model_batch)["logits"]
-            loss = F.binary_cross_entropy_with_logits(logits, targets, pos_weight=pos_weight)
+            loss = F.binary_cross_entropy_with_logits(logits, targets)
         scaler.scale(loss * study_count).backward()
         total_loss += loss.item() * study_count
         seen_studies += study_count
@@ -234,6 +226,29 @@ def evaluate(model, loader, device, amp):
     return metrics
 
 
+def training_evaluation_report(metrics=None):
+    """Prefix evaluation metrics so training and validation results stay unambiguous."""
+    if metrics is None:
+        return {
+            "train_eval_loss": None,
+            "train_per_class_auc": None,
+            "train_macro_auc": None,
+            "train_auc_classes": None,
+            "train_per_class_ap": None,
+            "train_macro_ap": None,
+            "train_macro_f1_0.5": None,
+        }
+    return {
+        "train_eval_loss": metrics["loss"],
+        "train_per_class_auc": metrics["per_class_auc"],
+        "train_macro_auc": metrics["macro_auc"],
+        "train_auc_classes": metrics["auc_classes"],
+        "train_per_class_ap": metrics["per_class_ap"],
+        "train_macro_ap": metrics["macro_ap"],
+        "train_macro_f1_0.5": metrics["macro_f1_0.5"],
+    }
+
+
 def preprocessing_config(args):
     return {
         "image_size": args.image_size,
@@ -251,7 +266,10 @@ def architecture_config(args):
         "metadata_dim": args.metadata_dim,
         "attention_heads": args.attention_heads,
         "dropout": args.dropout,
-        "metadata_inputs": ["ViewPosition", "PatientOrientation"],
+        "local_token_grid": args.local_token_grid,
+        "local_tokens_per_patch": args.local_token_grid ** 2,
+        "local_tokens_per_image": 4 * args.local_token_grid ** 2,
+        "metadata_inputs": ["ViewPosition", "PatientOrientation", "Rows", "Columns", "aspect_ratio"],
     }
 
 
@@ -262,9 +280,6 @@ def save_checkpoint(path, model, optimizer, scheduler, scaler, epoch, best_auc, 
         "epoch": epoch, "optimizer_step": scheduler.last_epoch,
         "best_macro_auc": best_auc, "class_names": list(CLASS_NAMES),
         "preprocessing": preprocessing_config(args), "architecture": architecture_config(args),
-        "pos_weight": args.pos_weight,
-        "label_positives": args.label_positives,
-        "label_negatives": args.label_negatives,
         "config": vars(args) | {"data_root": str(args.data_root), "output_dir": str(args.output_dir),
                                   "resume": str(args.resume) if args.resume else None},
         "torch_rng_state": torch.get_rng_state(), "python_rng_state": random.getstate(),
@@ -274,7 +289,7 @@ def save_checkpoint(path, model, optimizer, scheduler, scaler, epoch, best_auc, 
     torch.save(payload, path)
 
 
-def restore_checkpoint(path, model, optimizer, scheduler, scaler, args, pos_weight):
+def restore_checkpoint(path, model, optimizer, scheduler, scaler, args):
     checkpoint = torch.load(path, map_location="cpu")
     if checkpoint.get("class_names") != list(CLASS_NAMES):
         raise ValueError("checkpoint class order mismatch")
@@ -282,9 +297,6 @@ def restore_checkpoint(path, model, optimizer, scheduler, scaler, args, pos_weig
         raise ValueError("checkpoint preprocessing differs from current arguments")
     if checkpoint.get("architecture") != architecture_config(args):
         raise ValueError("checkpoint architecture differs from current arguments")
-    saved_pos_weight = checkpoint.get("pos_weight")
-    if saved_pos_weight is None or not torch.allclose(torch.tensor(saved_pos_weight), pos_weight.cpu()):
-        raise ValueError("checkpoint pos_weight differs from current training labels")
     model.load_state_dict(checkpoint["model"])
     optimizer.load_state_dict(checkpoint["optimizer"])
     scheduler.load_state_dict(checkpoint["scheduler"])
@@ -300,6 +312,10 @@ def main(argv=None):
     args = parse_args(argv)
     if args.local_canvas_size % 2:
         raise ValueError("--local-canvas-size must be even")
+    if args.local_token_grid < 1:
+        raise ValueError("--local-token-grid must be positive")
+    if args.train_eval_interval < 0:
+        raise ValueError("--train-eval-interval must be non-negative")
     seed_everything(args.seed)
     device = torch.device("cuda" if args.device == "auto" and torch.cuda.is_available()
                           else "cpu" if args.device == "auto" else args.device)
@@ -312,23 +328,30 @@ def main(argv=None):
     else:
         run_dir = create_timestamped_run_dir(args.output_dir)
     args.output_dir = run_dir
-    pos_weight, positives, negatives = calculate_sqrt_pos_weight(args.data_root / "train.csv")
-    args.pos_weight = pos_weight.tolist()
-    args.label_positives = positives
-    args.label_negatives = negatives
-    pos_weight = pos_weight.to(device)
     common = dict(image_size=args.image_size, local_canvas_size=args.local_canvas_size,
                   max_images_per_study=args.max_images_per_study)
     train_data = StudyDataset(args.data_root / "train.csv", args.data_root / "train",
                               augment=True, max_studies=args.max_train_studies, **common)
+    train_eval_data = None
+    if args.train_eval_interval:
+        # This creates only a compact CSV index; image pixels are still loaded on demand.
+        train_eval_data = StudyDataset(
+            args.data_root / "train.csv", args.data_root / "train",
+            augment=False, max_studies=args.max_train_studies, **common,
+        )
     valid_data = StudyDataset(args.data_root / "valid.csv", args.data_root / "valid",
                               augment=False, max_studies=args.max_valid_studies, **common)
     loader_args = dict(batch_size=args.batch_size, num_workers=args.workers,
                        collate_fn=collate_studies, pin_memory=device.type == "cuda")
     train_loader = DataLoader(train_data, shuffle=True, **loader_args)
+    train_eval_loader = (
+        DataLoader(train_eval_data, shuffle=False, **loader_args)
+        if train_eval_data is not None else None
+    )
     valid_loader = DataLoader(valid_data, shuffle=False, **loader_args)
     model = StudyMultiInputNet(args.feature_dim, args.metadata_dim,
-                               args.attention_heads, args.dropout).to(device)
+                               args.attention_heads, args.dropout,
+                               args.local_token_grid).to(device)
     optimizer = make_optimizer(model, args)
     updates_per_epoch = max(1, math.ceil(len(train_data) / args.accum_studies))
     total_updates = max(1, updates_per_epoch * args.epochs)
@@ -345,18 +368,22 @@ def main(argv=None):
     start_epoch, best_auc = 1, -math.inf
     if args.resume:
         start_epoch, best_auc = restore_checkpoint(
-            args.resume, model, optimizer, scheduler, scaler, args, pos_weight
+            args.resume, model, optimizer, scheduler, scaler, args
         )
     parameter_count = sum(p.numel() for p in model.parameters())
     write_run_config(run_dir, args, device, parameter_count, len(train_data), len(valid_data))
     print(json.dumps({"run_dir": str(run_dir), "device": str(device), "parameters": parameter_count,
                       "train_studies": len(train_data), "valid_studies": len(valid_data),
-                      "pos_weight": args.pos_weight}))
+                      "local_tokens_per_image": 4 * args.local_token_grid ** 2}))
     for epoch in range(start_epoch, args.epochs + 1):
         epoch_started = time.perf_counter()
         train_loss = train_epoch(
-            model, train_loader, optimizer, scheduler, scaler, device, args, pos_weight
+            model, train_loader, optimizer, scheduler, scaler, device, args
         )
+        train_eval_metrics = None
+        if train_eval_loader is not None and epoch % args.train_eval_interval == 0:
+            print(json.dumps({"epoch": epoch, "phase": "train_eval"}))
+            train_eval_metrics = evaluate(model, train_eval_loader, device, args.amp)
         metrics = evaluate(model, valid_loader, device, args.amp)
         if math.isfinite(metrics["macro_auc"]) and metrics["macro_auc"] > best_auc:
             best_auc = metrics["macro_auc"]
@@ -367,6 +394,7 @@ def main(argv=None):
             "optimizer_step": scheduler.last_epoch,
             "learning_rate": scheduler.get_last_lr()[0],
             "train_loss": train_loss,
+            **training_evaluation_report(train_eval_metrics),
             **metrics,
             "best_macro_auc": best_auc,
             "epoch_seconds": time.perf_counter() - epoch_started,

@@ -123,9 +123,9 @@ Subject_id  Study_id Predict_class Probability
 
 代码严格以 `(Subject_id, Study_id)` 为一个样本，并且不使用任何预训练权重：
 
-- 局部分支：原图使用 Lanczos 保细节缩放并填充至 `640×640`，按 2×2 网格切成四张 `320×320` 单通道图，使用共享轻量残差 CNN 得到四个局部 token；
+- 局部分支：原图使用 Lanczos 保细节缩放并填充至 `640×640`，按 2×2 网格切成四张 `320×320` 单通道图；共享轻量残差 CNN 为每块保留 `2×2` 空间特征，因此每张图得到 `4×4=16` 个局部 token；
 - 全局分支：完整图像缩放并填充至 `320×320`，使用轻量残差网络得到全局特征；
-- 元数据分支：只编码 `ViewPosition` 和 `PatientOrientation`，不输入原始高宽和长宽比；
+- 元数据分支：恢复 v1 输入，编码 `ViewPosition`、`PatientOrientation`、原始高宽和长宽比；
 - 融合：10 个可学习类别查询由全局特征和元数据条件化，对同一 Study 的全部局部 token 做交叉注意力，最后输出 10 个 logits。
 
 四象限按图像坐标定义为左上、右上、左下、右下，只提供粗粒度位置先验；代码不会假定所有文件都能仅凭数组左右方向准确对应患者解剖左右侧。
@@ -149,12 +149,16 @@ python audit_data.py --data-root cxr_first --output data_audit.json
 云端正式训练示例：
 
 ```bash
-python train.py --data-root cxr_first --output-dir outputs/multiscale --epochs 50 --image-size 320 --local-canvas-size 640 --feature-dim 128 --batch-size 32 --accum-studies 32 --workers 16 --device cuda --amp
+python train.py --data-root cxr_first --output-dir outputs/multiscale --epochs 50 --image-size 320 --local-canvas-size 640 --local-token-grid 2 --feature-dim 128 --batch-size 64 --accum-studies 64 --workers 16 --device cuda --amp
 ```
 
 建议在云端新建干净环境后安装 `requirements.txt`。模型从头训练，不依赖 torchvision，也不会下载任何外部权重。
 
-训练损失使用完整训练集按 Study 统计的 `sqrt(N_negative/N_positive)` 类别权重，并裁剪到 `[0.25, 10]`。权重及各类正负 Study 数会写入 `config.json` 和 checkpoint。`train_loss` 是加权 BCE，而验证 `loss` 是未加权 BCE，因此应分别观察趋势，不直接比较绝对值。
+训练损失恢复为 v1 的未加权 `BCEWithLogitsLoss`，训练和验证 loss 使用相同口径。局部注意力输入由 v1 的每张图 4 个 token 增加为 16 个 token。
+
+模型默认 `dropout=0.0`，交叉注意力、注意力残差和前馈网络中的 dropout 均关闭；如需重新启用，可显式传入例如 `--dropout 0.1`。
+
+默认每隔 5 轮额外关闭数据增强并以 `eval()` 模式完整评估一次训练集，记录 `train_eval_loss`、`train_macro_auc`、`train_per_class_auc`、训练集 AP 和 F1；未到评估轮次时这些字段为 `null`。验证集字段仍为 `loss`、`macro_auc` 和 `per_class_auc`，`best.pt` 仍只按验证集 `macro_auc` 选择。可用 `--train-eval-interval 0` 关闭训练集评估。
 
 每次新训练会在 `--output-dir` 下自动建立北京时间目录，例如：
 
@@ -188,3 +192,10 @@ python predict.py --checkpoint outputs/multiscale/20261024_153012/best.pt --data
 v1.0 20261024_222916   epoch22 0.769
 v2.0 增加2*2网格局部输入精度320->512 
 v3.0 回退到1.0精度处理不变，去掉结构化数据图片长宽和长宽比，启用裁剪后的 sqrt_ratio pos_weight
+v4.0 恢复 v1 元数据与未加权 BCE；每个局部块保留 2×2 特征，四块共 16 个局部 token
+python train.py --data-root cxr_first --output-dir outputs/multiscale \
+  --epochs 50 --image-size 320 --local-canvas-size 640 \
+  --local-token-grid 2 --feature-dim 128 \
+  --batch-size 64 --accum-studies 64 \
+  --train-eval-interval 5 \
+  --workers 12 --device cuda --amp

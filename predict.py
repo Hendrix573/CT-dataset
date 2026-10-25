@@ -63,7 +63,8 @@ def main():
                         num_workers=args.workers, collate_fn=collate_studies,
                         pin_memory=device.type == "cuda")
     model = StudyMultiInputNet(arch["feature_dim"], arch["metadata_dim"],
-                               arch["attention_heads"], arch["dropout"]).to(device)
+                               arch["attention_heads"], arch["dropout"],
+                               arch["local_token_grid"]).to(device)
     model.load_state_dict(checkpoint["model"])
     model.eval()
     ids, probability_rows = [], []

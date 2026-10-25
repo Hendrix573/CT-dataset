@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from .data import ORIENTATION_VOCAB, VIEW_VOCAB
@@ -47,11 +48,19 @@ class LightweightEncoder(nn.Module):
                 stages.append(ResidualBlock(in_channels, out_channels, stride))
                 in_channels = out_channels
         self.stages = nn.Sequential(*stages)
-        self.pool = nn.AdaptiveAvgPool2d(1)
         self.projection = nn.Linear(channels[-1], out_dim)
 
+    def forward_features(self, x):
+        return self.stages(self.stem(x))
+
+    def forward_tokens(self, x, grid_size=1):
+        features = self.forward_features(x)
+        features = F.adaptive_avg_pool2d(features, (grid_size, grid_size))
+        features = features.flatten(2).transpose(1, 2)
+        return self.projection(features)
+
     def forward(self, x):
-        return self.projection(self.pool(self.stages(self.stem(x))).flatten(1))
+        return self.forward_tokens(x, grid_size=1).squeeze(1)
 
 
 class MetadataEncoder(nn.Module):
@@ -59,11 +68,11 @@ class MetadataEncoder(nn.Module):
         super().__init__()
         self.view_embedding = nn.Embedding(len(VIEW_VOCAB), 16)
         self.orientation_embedding = nn.Embedding(len(ORIENTATION_VOCAB), 8)
-        self.network = nn.Sequential(nn.Linear(24, 64), nn.SiLU(), nn.Linear(64, out_dim))
+        self.network = nn.Sequential(nn.Linear(27, 64), nn.SiLU(), nn.Linear(64, out_dim))
 
-    def forward(self, view_ids, orientation_ids):
+    def forward(self, view_ids, orientation_ids, numeric_metadata):
         return self.network(torch.cat((
-            self.view_embedding(view_ids), self.orientation_embedding(orientation_ids)
+            self.view_embedding(view_ids), self.orientation_embedding(orientation_ids), numeric_metadata
         ), dim=-1))
 
 
@@ -76,13 +85,21 @@ def study_mean(features, image_to_study, num_studies):
 
 class StudyMultiInputNet(nn.Module):
     """Local quadrants + global image + metadata, fused by class-query attention."""
-    def __init__(self, feature_dim=128, metadata_dim=32, attention_heads=4, dropout=0.1):
+    def __init__(self, feature_dim=128, metadata_dim=32, attention_heads=4, dropout=0.0,
+                 local_token_grid=2):
         super().__init__()
         self.feature_dim = feature_dim
+        self.local_token_grid = local_token_grid
+        self.tokens_per_patch = local_token_grid ** 2
+        if local_token_grid < 1:
+            raise ValueError("local_token_grid must be positive")
         self.local_encoder = LightweightEncoder(blocks=(1, 1, 1, 1), out_dim=feature_dim)
         self.global_encoder = LightweightEncoder(blocks=(2, 2, 2, 2), out_dim=feature_dim)
         self.metadata_encoder = MetadataEncoder(metadata_dim)
         self.quadrant_embedding = nn.Parameter(torch.randn(4, feature_dim) * 0.02)
+        self.patch_cell_embedding = nn.Parameter(
+            torch.randn(self.tokens_per_patch, feature_dim) * 0.02
+        )
         self.metadata_to_token = nn.Linear(metadata_dim, feature_dim)
         self.class_queries = nn.Parameter(torch.randn(10, feature_dim) * 0.02)
         self.global_to_query = nn.Linear(feature_dim, feature_dim)
@@ -105,7 +122,8 @@ class StudyMultiInputNet(nn.Module):
 
     @staticmethod
     def _pad_study_tokens(tokens, image_to_study, num_studies):
-        lengths = [int((image_to_study == i).sum()) * 4 for i in range(num_studies)]
+        tokens_per_image = tokens.shape[1]
+        lengths = [int((image_to_study == i).sum()) * tokens_per_image for i in range(num_studies)]
         max_length = max(lengths)
         padded = tokens.new_zeros((num_studies, max_length, tokens.shape[-1]))
         valid = torch.zeros((num_studies, max_length), dtype=torch.bool, device=tokens.device)
@@ -122,10 +140,21 @@ class StudyMultiInputNet(nn.Module):
         num_studies = int(batch["num_studies"])
         num_images = global_images.shape[0]
 
-        local = self.local_encoder(local_patches.reshape(-1, *local_patches.shape[2:]))
-        local = local.view(num_images, 4, self.feature_dim)
-        metadata = self.metadata_encoder(batch["view_ids"], batch["orientation_ids"])
-        local = local + self.quadrant_embedding.unsqueeze(0) + self.metadata_to_token(metadata).unsqueeze(1)
+        local = self.local_encoder.forward_tokens(
+            local_patches.reshape(-1, *local_patches.shape[2:]),
+            grid_size=self.local_token_grid,
+        )
+        local = local.view(num_images, 4, self.tokens_per_patch, self.feature_dim)
+        metadata = self.metadata_encoder(
+            batch["view_ids"], batch["orientation_ids"], batch["numeric_metadata"]
+        )
+        local = (
+            local
+            + self.quadrant_embedding[None, :, None, :]
+            + self.patch_cell_embedding[None, None, :, :]
+            + self.metadata_to_token(metadata)[:, None, None, :]
+        )
+        local = local.flatten(1, 2)
         tokens, valid_tokens = self._pad_study_tokens(local, image_to_study, num_studies)
 
         image_global = self.global_encoder(global_images)
