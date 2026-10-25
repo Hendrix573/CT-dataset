@@ -149,7 +149,7 @@ python audit_data.py --data-root cxr_first --output data_audit.json
 云端正式训练示例：
 
 ```bash
-python train.py --data-root cxr_first --output-dir outputs/multiscale --epochs 50 --image-size 320 --local-canvas-size 1024 --feature-dim 128 --batch-size 8 --accum-studies 16 --workers 8 --device cuda --amp
+python train.py --data-root cxr_first --output-dir outputs/multiscale --epochs 50 --image-size 320 --local-canvas-size 1024 --feature-dim 128 --batch-size 32 --accum-studies 32 --workers 8 --device cuda --amp
 ```
 
 建议在云端新建干净环境后安装 `requirements.txt`。模型从头训练，不依赖 torchvision，也不会下载任何外部权重。
@@ -181,3 +181,7 @@ python predict.py --checkpoint outputs/multiscale/20261024_153012/best.pt --data
 
 输出为 `outputs/predictions/submission_dense.csv` 和 `submission_thresholded.csv`。由于官方说明中 Macro-AUC 与“仅提交超过 0.5 的类别”存在歧义，提交前需根据官方样例或评测答疑确定最终采用哪一种。
 
+
+## process
+v1.0 2024
+v2.0 
