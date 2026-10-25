@@ -100,10 +100,10 @@ def read_studies(csv_path, image_root, max_studies=None) -> list[StudyRecord]:
 def _letterbox_gray(image: Image.Image, size: int) -> Image.Image:
     width, height = image.size
     scale = min(size / width, size / height)
-    resized = image.resize(
-        (max(1, round(width * scale)), max(1, round(height * scale))),
-        Image.Resampling.BILINEAR,
-    )
+    target_size = (max(1, round(width * scale)), max(1, round(height * scale)))
+    # Lanczos preserves fine lines and small opacities better when reducing large radiographs.
+    resampling = Image.Resampling.LANCZOS if scale < 1.0 else Image.Resampling.BICUBIC
+    resized = image.resize(target_size, resampling)
     canvas = Image.new("L", (size, size), color=128)
     canvas.paste(resized, ((size - resized.width) // 2, (size - resized.height) // 2))
     return canvas
@@ -147,7 +147,7 @@ def _numeric_metadata(record: ImageRecord) -> torch.Tensor:
 
 
 class StudyDataset(Dataset):
-    def __init__(self, csv_path, image_root, image_size=320, local_canvas_size=640,
+    def __init__(self, csv_path, image_root, image_size=320, local_canvas_size=1024,
                  augment=False, max_studies=None, max_images_per_study=None) -> None:
         self.records = read_studies(csv_path, image_root, max_studies=max_studies)
         self.image_size = image_size

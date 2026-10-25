@@ -123,7 +123,7 @@ Subject_id  Study_id Predict_class Probability
 
 代码严格以 `(Subject_id, Study_id)` 为一个样本，并且不使用任何预训练权重：
 
-- 局部分支：原图保持比例缩放并填充至 `640×640`，按 2×2 网格切成四张 `320×320` 单通道图，使用共享轻量残差 CNN 得到四个局部 token；
+- 局部分支：原图使用 Lanczos 保细节缩放并填充至 `1024×1024`，按 2×2 网格切成四张 `512×512` 单通道图，使用共享轻量残差 CNN 得到四个局部 token；
 - 全局分支：完整图像缩放并填充至 `320×320`，使用轻量残差网络得到全局特征；
 - 元数据分支：编码 `ViewPosition`、`PatientOrientation`、原始高宽和长宽比；
 - 融合：10 个可学习类别查询由全局特征和元数据条件化，对同一 Study 的全部局部 token 做交叉注意力，最后输出 10 个 logits。
@@ -149,7 +149,7 @@ python audit_data.py --data-root cxr_first --output data_audit.json
 云端正式训练示例：
 
 ```bash
-python train.py --data-root cxr_first --output-dir outputs/multiscale --epochs 50 --image-size 320 --local-canvas-size 640 --feature-dim 128 --batch-size 1 --accum-studies 16 --workers 4 --device cuda --amp
+python train.py --data-root cxr_first --output-dir outputs/multiscale --epochs 50 --image-size 320 --local-canvas-size 1024 --feature-dim 128 --batch-size 8 --accum-studies 16 --workers 8 --device cuda --amp
 ```
 
 建议在云端新建干净环境后安装 `requirements.txt`。模型从头训练，不依赖 torchvision，也不会下载任何外部权重。
@@ -170,7 +170,7 @@ outputs/multiscale/20261024_153012/
 中断后可在保持模型结构、图像尺寸及数据划分不变的前提下恢复；`--epochs` 表示最终总轮数：
 
 ```bash
-python train.py --data-root cxr_first --epochs 50 --image-size 320 --local-canvas-size 640 --device cuda --amp --resume outputs/multiscale/20261024_153012/last.pt
+python train.py --data-root cxr_first --epochs 50 --image-size 320 --local-canvas-size 1024 --device cuda --amp --resume outputs/multiscale/20261024_153012/last.pt
 ```
 
 测试集推理同时保留 dense 与阈值版结果：

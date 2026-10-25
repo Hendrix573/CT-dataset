@@ -5,3 +5,4 @@
 outputs/
 *.pt
 *.pth
+/__pycache__

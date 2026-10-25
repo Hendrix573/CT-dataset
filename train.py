@@ -95,7 +95,10 @@ def parse_args(argv=None):
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/multiscale"))
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--image-size", type=int, default=320, help="Full-image branch size")
-    parser.add_argument("--local-canvas-size", type=int, default=640, help="Split into four half-size patches")
+    parser.add_argument(
+        "--local-canvas-size", type=int, default=1024,
+        help="High-resolution local canvas split into four 512x512 patches by default",
+    )
     parser.add_argument("--feature-dim", type=int, default=128)
     parser.add_argument("--metadata-dim", type=int, default=32)
     parser.add_argument("--attention-heads", type=int, default=4)
