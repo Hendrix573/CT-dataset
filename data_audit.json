@@ -1,0 +1,258 @@
+{
+  "note": "CSV metadata was streamed; image pixels were not decoded.",
+  "train": {
+    "patients": 11055,
+    "studies": 18513,
+    "images": 30344,
+    "images_per_study": {
+      "1": 8507,
+      "2": 8369,
+      "3": 1465,
+      "4": 160,
+      "5": 9,
+      "6": 2,
+      "7": 1
+    },
+    "height": {
+      "min": 1409,
+      "mean": 2695.9111191668862,
+      "max": 4280
+    },
+    "width": {
+      "min": 1067,
+      "mean": 2493.243441866596,
+      "max": 4280
+    },
+    "width_to_height_ratio": {
+      "min": 0.5341246290801187,
+      "mean": 0.9356364349037696,
+      "max": 1.6805797101449276
+    },
+    "view_position": {
+      "<missing>": 1202,
+      "AP": 12152,
+      "LATERAL": 6554,
+      "LL": 2831,
+      "PA": 7604,
+      "PA LLD": 1
+    },
+    "view_position_missing_rate": 0.039612443975744795,
+    "patient_orientation": {
+      "<missing>": 3307,
+      "Erect": 23651,
+      "Recumbent": 3386
+    },
+    "patient_orientation_missing_rate": 0.10898365409965727,
+    "missing_image_count": 0,
+    "missing_image_examples": [],
+    "duplicate_image_rows": 0,
+    "inconsistent_study_label_count": 0,
+    "support_devices": "column unavailable in this dataset",
+    "labels": {
+      "1": {
+        "positive_studies": 622,
+        "negative_studies": 17891,
+        "invalid_studies": 0
+      },
+      "2": {
+        "positive_studies": 900,
+        "negative_studies": 17613,
+        "invalid_studies": 0
+      },
+      "3": {
+        "positive_studies": 942,
+        "negative_studies": 17571,
+        "invalid_studies": 0
+      },
+      "4": {
+        "positive_studies": 1436,
+        "negative_studies": 17077,
+        "invalid_studies": 0
+      },
+      "5": {
+        "positive_studies": 2404,
+        "negative_studies": 16109,
+        "invalid_studies": 0
+      },
+      "6": {
+        "positive_studies": 3885,
+        "negative_studies": 14628,
+        "invalid_studies": 0
+      },
+      "7": {
+        "positive_studies": 3968,
+        "negative_studies": 14545,
+        "invalid_studies": 0
+      },
+      "8": {
+        "positive_studies": 4508,
+        "negative_studies": 14005,
+        "invalid_studies": 0
+      },
+      "9": {
+        "positive_studies": 4654,
+        "negative_studies": 13859,
+        "invalid_studies": 0
+      },
+      "10": {
+        "positive_studies": 6683,
+        "negative_studies": 11830,
+        "invalid_studies": 0
+      }
+    },
+    "no_finding_conflict_count": 0
+  },
+  "valid": {
+    "patients": 228,
+    "studies": 859,
+    "images": 1422,
+    "images_per_study": {
+      "1": 391,
+      "2": 380,
+      "3": 81,
+      "4": 7
+    },
+    "height": {
+      "min": 1716,
+      "mean": 2674.6736990154714,
+      "max": 4280
+    },
+    "width": {
+      "min": 1266,
+      "mean": 2475.3600562587903,
+      "max": 3520
+    },
+    "width_to_height_ratio": {
+      "min": 0.6261127596439169,
+      "mean": 0.9365106272974635,
+      "max": 1.6698060941828254
+    },
+    "view_position": {
+      "<missing>": 39,
+      "AP": 584,
+      "LATERAL": 284,
+      "LL": 151,
+      "PA": 364
+    },
+    "view_position_missing_rate": 0.027426160337552744,
+    "patient_orientation": {
+      "<missing>": 135,
+      "Erect": 1088,
+      "Recumbent": 199
+    },
+    "patient_orientation_missing_rate": 0.0949367088607595,
+    "missing_image_count": 0,
+    "missing_image_examples": [],
+    "duplicate_image_rows": 0,
+    "inconsistent_study_label_count": 0,
+    "support_devices": "column unavailable in this dataset",
+    "labels": {
+      "1": {
+        "positive_studies": 24,
+        "negative_studies": 835,
+        "invalid_studies": 0
+      },
+      "2": {
+        "positive_studies": 37,
+        "negative_studies": 822,
+        "invalid_studies": 0
+      },
+      "3": {
+        "positive_studies": 46,
+        "negative_studies": 813,
+        "invalid_studies": 0
+      },
+      "4": {
+        "positive_studies": 68,
+        "negative_studies": 791,
+        "invalid_studies": 0
+      },
+      "5": {
+        "positive_studies": 115,
+        "negative_studies": 744,
+        "invalid_studies": 0
+      },
+      "6": {
+        "positive_studies": 177,
+        "negative_studies": 682,
+        "invalid_studies": 0
+      },
+      "7": {
+        "positive_studies": 193,
+        "negative_studies": 666,
+        "invalid_studies": 0
+      },
+      "8": {
+        "positive_studies": 214,
+        "negative_studies": 645,
+        "invalid_studies": 0
+      },
+      "9": {
+        "positive_studies": 260,
+        "negative_studies": 599,
+        "invalid_studies": 0
+      },
+      "10": {
+        "positive_studies": 306,
+        "negative_studies": 553,
+        "invalid_studies": 0
+      }
+    },
+    "no_finding_conflict_count": 0
+  },
+  "test": {
+    "patients": 136,
+    "studies": 1414,
+    "images": 2218,
+    "images_per_study": {
+      "1": 775,
+      "2": 496,
+      "3": 122,
+      "4": 20,
+      "5": 1
+    },
+    "height": {
+      "min": 1554,
+      "mean": 2660.1510369702432,
+      "max": 4280
+    },
+    "width": {
+      "min": 1286,
+      "mean": 2467.857980162308,
+      "max": 4280
+    },
+    "width_to_height_ratio": {
+      "min": 0.6409495548961425,
+      "mean": 0.938158314979469,
+      "max": 1.4044117647058822
+    },
+    "view_position": {
+      "<missing>": 139,
+      "AP": 1090,
+      "LATERAL": 370,
+      "LL": 217,
+      "PA": 402
+    },
+    "view_position_missing_rate": 0.06266907123534717,
+    "patient_orientation": {
+      "<missing>": 369,
+      "Erect": 1587,
+      "Recumbent": 262
+    },
+    "patient_orientation_missing_rate": 0.16636609558160506,
+    "missing_image_count": 0,
+    "missing_image_examples": [],
+    "duplicate_image_rows": 0,
+    "inconsistent_study_label_count": 0,
+    "support_devices": "column unavailable in this dataset"
+  },
+  "subject_intersections": {
+    "train_valid": 0,
+    "train_test": 0,
+    "valid_test": 0
+  },
+  "image_integrity": {
+    "corrupt_files": "not checked; run a separate full image decode audit before final training",
+    "duplicate_file_content": "not checked; hashing the full image corpus was intentionally avoided"
+  }
+}

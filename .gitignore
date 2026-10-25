@@ -1,0 +1,7 @@
+# Large local chest X-ray dataset
+/cxr_first/
+/cxr_first.zip
+/temp
+outputs/
+*.pt
+*.pth
