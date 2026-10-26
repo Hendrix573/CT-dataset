@@ -117,6 +117,14 @@ def parse_args(argv=None):
         "--local-token-grid", type=int, default=2,
         help="Spatial token grid retained inside each of the four local patches",
     )
+    parser.add_argument(
+        "--global-tokens", action=argparse.BooleanOptionalAction, default=True,
+        help="Add one view-aware full-image token per image to class-query attention",
+    )
+    parser.add_argument(
+        "--study-mean-residual", action=argparse.BooleanOptionalAction, default=True,
+        help="Keep mean-pooled global image and metadata features as residual inputs",
+    )
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--batch-size", type=int, default=1, help="Studies per micro-batch")
     parser.add_argument("--accum-studies", type=int, default=16)
@@ -284,6 +292,7 @@ def preprocessing_config(args):
 def architecture_config(args):
     return {
         "name": "StudyMultiInputNet",
+        "version": "v5.0",
         "feature_dim": args.feature_dim,
         "metadata_dim": args.metadata_dim,
         "attention_heads": args.attention_heads,
@@ -291,6 +300,10 @@ def architecture_config(args):
         "local_token_grid": args.local_token_grid,
         "local_tokens_per_patch": args.local_token_grid ** 2,
         "local_tokens_per_image": 4 * args.local_token_grid ** 2,
+        "global_tokens": args.global_tokens,
+        "global_tokens_per_image": int(args.global_tokens),
+        "attention_tokens_per_image": 4 * args.local_token_grid ** 2 + int(args.global_tokens),
+        "study_mean_residual": args.study_mean_residual,
         "metadata_inputs": ["ViewPosition", "PatientOrientation", "Rows", "Columns", "aspect_ratio"],
     }
 
@@ -381,7 +394,8 @@ def main(argv=None):
     valid_loader = DataLoader(valid_data, shuffle=False, **loader_args)
     model = StudyMultiInputNet(args.feature_dim, args.metadata_dim,
                                args.attention_heads, args.dropout,
-                               args.local_token_grid).to(device)
+                               args.local_token_grid, args.global_tokens,
+                               args.study_mean_residual).to(device)
     optimizer = make_optimizer(model, args)
     updates_per_epoch = max(1, math.ceil(len(train_data) / args.accum_studies))
     total_updates = max(1, updates_per_epoch * args.epochs)
@@ -405,6 +419,9 @@ def main(argv=None):
     print(json.dumps({"run_dir": str(run_dir), "device": str(device), "parameters": parameter_count,
                       "train_studies": len(train_data), "valid_studies": len(valid_data),
                       "local_tokens_per_image": 4 * args.local_token_grid ** 2,
+                      "global_tokens_per_image": int(args.global_tokens),
+                      "attention_tokens_per_image": 4 * args.local_token_grid ** 2 + int(args.global_tokens),
+                      "study_mean_residual": args.study_mean_residual,
                       "progressive_augment": args.progressive_augment,
                       "augmentation_ramp": [args.augmentation_ramp_start,
                                              args.augmentation_ramp_end]}))

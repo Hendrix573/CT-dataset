@@ -201,5 +201,33 @@ python train.py --data-root cxr_first --output-dir outputs/multiscale \
   --batch-size 64 --accum-studies 64 \
   --train-eval-interval 5 \
   --workers 12 --device cuda --amp
-v4.1 --dropout 0.1   epoch21 0.7684
-v4.2 在 v4.1 基础上增加第 3～15 轮渐进增强
+v4.1 增加--dropout 0.1   epoch21 0.7684
+v4.2 在 v4.1 基础上增加第 3～15 轮渐进增强 epoch27 0.771 "time": "2026-10-26T15:40:24.095566+08:00"
+
+v5.0 在 v4.2 基础上保留每图 16 个局部 token，并为每张图增加 1 个带
+`ViewPosition` 与 `PatientOrientation` embedding 的全局 token。每图共 17 个 token
+一起进入类别查询交叉注意力，使不同疾病能够分别选择 AP、PA、LATERAL 或 LL 视图。
+默认仍保留原有 Study 全局特征与元数据均值作为 residual；使用
+`--no-study-mean-residual` 可做完全移除均值汇聚的消融实验，使用
+`--no-global-tokens` 可回到旧版仅局部 token 的注意力结构。
+
+v5.0 正式训练示例：
+
+```bash
+python train.py --data-root cxr_first --output-dir outputs/multiscale_v5 \
+  --epochs 50 --image-size 320 --local-canvas-size 640 \
+  --local-token-grid 2 --feature-dim 128 --dropout 0.1 \
+  --global-tokens --study-mean-residual \
+  --batch-size 64 --accum-studies 64 \
+  --progressive-augment --augmentation-ramp-start 3 --augmentation-ramp-end 15 \
+  --train-eval-interval 5 --workers 12 --device cuda --amp
+```
+
+推理时可导出每个类别在每张图上的全局、局部和总注意力。权重已对 attention head
+取平均，同一 Study、同一类别下所有图像的 `Total_attention` 之和为 1：
+
+```bash
+python predict.py --checkpoint outputs/multiscale_v5/运行目录/best.pt \
+  --data-root cxr_first --device cuda --amp \
+  --attention-output outputs/predictions/v5_attention_views.csv
+```
