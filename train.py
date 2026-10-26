@@ -77,6 +77,7 @@ def append_metrics(run_dir: Path, report: dict) -> None:
         "train_auc_classes": safe_report["train_auc_classes"],
         "train_macro_ap": safe_report["train_macro_ap"],
         "train_macro_f1_0.5": safe_report["train_macro_f1_0.5"],
+        "augmentation_strength": safe_report["augmentation_strength"],
         "valid_loss": safe_report["loss"],
         "macro_auc": safe_report["macro_auc"], "auc_classes": safe_report["auc_classes"],
         "macro_ap": safe_report["macro_ap"], "macro_f1_0.5": safe_report["macro_f1_0.5"],
@@ -123,6 +124,12 @@ def parse_args(argv=None):
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--warmup-epochs", type=float, default=3.0)
+    parser.add_argument(
+        "--progressive-augment", action=argparse.BooleanOptionalAction, default=True,
+        help="Ramp conservative CXR augmentation from mild to full strength",
+    )
+    parser.add_argument("--augmentation-ramp-start", type=int, default=3)
+    parser.add_argument("--augmentation-ramp-end", type=int, default=15)
     parser.add_argument(
         "--train-eval-interval", type=int, default=5,
         help="Evaluate the augmentation-free training set every N epochs; 0 disables it",
@@ -256,6 +263,21 @@ def preprocessing_config(args):
         "channels": 1,
         "normalization": "x=(x/127.5)-1",
         "quadrants": ["image-left-upper", "image-right-upper", "image-left-lower", "image-right-lower"],
+        "training_augmentation": {
+            "progressive": args.progressive_augment,
+            "ramp_start_epoch": args.augmentation_ramp_start,
+            "ramp_end_epoch": args.augmentation_ramp_end,
+            "mild": {
+                "rotation_degrees": 2.0, "translation_fraction": 0.01,
+                "scale": [0.99, 1.01], "brightness": [0.98, 1.02],
+                "contrast": [0.98, 1.02], "gamma": [1.0, 1.0],
+            },
+            "full": {
+                "rotation_degrees": 7.0, "translation_fraction": 0.04,
+                "scale": [0.95, 1.05], "brightness": [0.90, 1.10],
+                "contrast": [0.85, 1.15], "gamma": [0.90, 1.10],
+            },
+        },
     }
 
 
@@ -316,6 +338,11 @@ def main(argv=None):
         raise ValueError("--local-token-grid must be positive")
     if args.train_eval_interval < 0:
         raise ValueError("--train-eval-interval must be non-negative")
+    if args.progressive_augment:
+        if args.augmentation_ramp_start < 0:
+            raise ValueError("--augmentation-ramp-start must be non-negative")
+        if args.augmentation_ramp_end <= args.augmentation_ramp_start:
+            raise ValueError("--augmentation-ramp-end must be greater than ramp start")
     seed_everything(args.seed)
     device = torch.device("cuda" if args.device == "auto" and torch.cuda.is_available()
                           else "cpu" if args.device == "auto" else args.device)
@@ -331,7 +358,10 @@ def main(argv=None):
     common = dict(image_size=args.image_size, local_canvas_size=args.local_canvas_size,
                   max_images_per_study=args.max_images_per_study)
     train_data = StudyDataset(args.data_root / "train.csv", args.data_root / "train",
-                              augment=True, max_studies=args.max_train_studies, **common)
+                              augment=True, max_studies=args.max_train_studies,
+                              progressive_augment=args.progressive_augment,
+                              augmentation_ramp_start=args.augmentation_ramp_start,
+                              augmentation_ramp_end=args.augmentation_ramp_end, **common)
     train_eval_data = None
     if args.train_eval_interval:
         # This creates only a compact CSV index; image pixels are still loaded on demand.
@@ -374,9 +404,14 @@ def main(argv=None):
     write_run_config(run_dir, args, device, parameter_count, len(train_data), len(valid_data))
     print(json.dumps({"run_dir": str(run_dir), "device": str(device), "parameters": parameter_count,
                       "train_studies": len(train_data), "valid_studies": len(valid_data),
-                      "local_tokens_per_image": 4 * args.local_token_grid ** 2}))
+                      "local_tokens_per_image": 4 * args.local_token_grid ** 2,
+                      "progressive_augment": args.progressive_augment,
+                      "augmentation_ramp": [args.augmentation_ramp_start,
+                                             args.augmentation_ramp_end]}))
     for epoch in range(start_epoch, args.epochs + 1):
         epoch_started = time.perf_counter()
+        train_data.set_epoch(epoch)
+        augmentation_strength = train_data.augmentation_strength
         train_loss = train_epoch(
             model, train_loader, optimizer, scheduler, scaler, device, args
         )
@@ -394,6 +429,7 @@ def main(argv=None):
             "optimizer_step": scheduler.last_epoch,
             "learning_rate": scheduler.get_last_lr()[0],
             "train_loss": train_loss,
+            "augmentation_strength": augmentation_strength,
             **training_evaluation_report(train_eval_metrics),
             **metrics,
             "best_macro_auc": best_auc,

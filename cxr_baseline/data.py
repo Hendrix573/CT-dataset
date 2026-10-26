@@ -115,17 +115,74 @@ def _to_tensor(image: Image.Image) -> torch.Tensor:
     return tensor.view(1, size, size).float().div_(127.5).sub_(1.0)
 
 
-def load_multiscale_image(path: Path, global_size: int, local_canvas_size: int, augment: bool):
+def progressive_augmentation_strength(epoch: int, ramp_start: int = 3,
+                                      ramp_end: int = 15) -> float:
+    """Return a [0, 1] curriculum strength: mild first, full after ramp_end."""
+    if epoch <= ramp_start:
+        return 0.0
+    return min(1.0, (epoch - ramp_start) / (ramp_end - ramp_start))
+
+
+def _progressive_augment(image: Image.Image, strength: float) -> Image.Image:
+    """Apply conservative, label-preserving CXR geometry and exposure changes."""
+    rotation = 2.0 + 5.0 * strength
+    translation = 0.01 + 0.03 * strength
+    scale_delta = 0.01 + 0.04 * strength
+    brightness_delta = 0.02 + 0.08 * strength
+    contrast_delta = 0.02 + 0.13 * strength
+    gamma_delta = 0.10 * strength
+
+    angle = math.radians(random.uniform(-rotation, rotation))
+    scale = random.uniform(1.0 - scale_delta, 1.0 + scale_delta)
+    width, height = image.size
+    translate_x = random.uniform(-translation, translation) * width
+    translate_y = random.uniform(-translation, translation) * height
+    center_x, center_y = width / 2.0, height / 2.0
+
+    # PIL expects the inverse mapping from output coordinates to input coordinates.
+    inverse_scale = 1.0 / scale
+    cosine = math.cos(angle) * inverse_scale
+    sine = math.sin(angle) * inverse_scale
+    affine = (
+        cosine,
+        sine,
+        center_x - cosine * (center_x + translate_x) - sine * (center_y + translate_y),
+        -sine,
+        cosine,
+        center_y + sine * (center_x + translate_x) - cosine * (center_y + translate_y),
+    )
+    image = ImageEnhance.Brightness(image).enhance(
+        random.uniform(1.0 - brightness_delta, 1.0 + brightness_delta)
+    )
+    image = ImageEnhance.Contrast(image).enhance(
+        random.uniform(1.0 - contrast_delta, 1.0 + contrast_delta)
+    )
+    if gamma_delta:
+        gamma = random.uniform(1.0 - gamma_delta, 1.0 + gamma_delta)
+        lookup = [round(255.0 * ((value / 255.0) ** gamma)) for value in range(256)]
+        image = image.point(lookup)
+    return image.transform(
+        image.size, Image.Transform.AFFINE, affine,
+        resample=Image.Resampling.BILINEAR, fillcolor=128,
+    )
+
+
+def load_multiscale_image(path: Path, global_size: int, local_canvas_size: int,
+                          augment: bool, augmentation_strength: Optional[float] = None):
     if local_canvas_size % 2:
         raise ValueError("local_canvas_size must be even for a 2x2 split")
     with Image.open(path) as source:
         image = source.convert("L")
         if augment:
-            image = image.rotate(
-                random.uniform(-5.0, 5.0), resample=Image.Resampling.BILINEAR, fillcolor=128
-            )
-            image = ImageEnhance.Brightness(image).enhance(random.uniform(0.95, 1.05))
-            image = ImageEnhance.Contrast(image).enhance(random.uniform(0.95, 1.05))
+            if augmentation_strength is None:
+                image = image.rotate(
+                    random.uniform(-5.0, 5.0),
+                    resample=Image.Resampling.BILINEAR, fillcolor=128,
+                )
+                image = ImageEnhance.Brightness(image).enhance(random.uniform(0.95, 1.05))
+                image = ImageEnhance.Contrast(image).enhance(random.uniform(0.95, 1.05))
+            else:
+                image = _progressive_augment(image, augmentation_strength)
         global_image = _letterbox_gray(image, global_size)
         local_canvas = _letterbox_gray(image, local_canvas_size)
     patch = local_canvas_size // 2
@@ -149,12 +206,29 @@ def _numeric_metadata(record: ImageRecord) -> torch.Tensor:
 
 class StudyDataset(Dataset):
     def __init__(self, csv_path, image_root, image_size=320, local_canvas_size=640,
-                 augment=False, max_studies=None, max_images_per_study=None) -> None:
+                 augment=False, max_studies=None, max_images_per_study=None,
+                 progressive_augment=False, augmentation_ramp_start=3,
+                 augmentation_ramp_end=15) -> None:
         self.records = read_studies(csv_path, image_root, max_studies=max_studies)
         self.image_size = image_size
         self.local_canvas_size = local_canvas_size
         self.augment = augment
         self.max_images_per_study = max_images_per_study
+        self.progressive_augment = progressive_augment
+        self.augmentation_ramp_start = augmentation_ramp_start
+        self.augmentation_ramp_end = augmentation_ramp_end
+        self.epoch = 1
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+
+    @property
+    def augmentation_strength(self) -> Optional[float]:
+        if not self.augment or not self.progressive_augment:
+            return None
+        return progressive_augmentation_strength(
+            self.epoch, self.augmentation_ramp_start, self.augmentation_ramp_end
+        )
 
     def __len__(self):
         return len(self.records)
@@ -165,7 +239,8 @@ class StudyDataset(Dataset):
         global_images, local_patches = [], []
         for image_record in image_records:
             global_image, patches = load_multiscale_image(
-                image_record.path, self.image_size, self.local_canvas_size, self.augment
+                image_record.path, self.image_size, self.local_canvas_size, self.augment,
+                self.augmentation_strength,
             )
             global_images.append(global_image)
             local_patches.append(patches)

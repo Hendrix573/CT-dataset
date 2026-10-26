@@ -149,7 +149,7 @@ python audit_data.py --data-root cxr_first --output data_audit.json
 云端正式训练示例：
 
 ```bash
-python train.py --data-root cxr_first --output-dir outputs/multiscale --epochs 50 --image-size 320 --local-canvas-size 640 --local-token-grid 2 --feature-dim 128 --batch-size 64 --accum-studies 64 --workers 16 --device cuda --amp
+python train.py --data-root cxr_first --output-dir outputs/multiscale --epochs 50 --image-size 320 --local-canvas-size 640 --local-token-grid 2 --feature-dim 128 --dropout 0.1 --batch-size 64 --accum-studies 64 --progressive-augment --augmentation-ramp-start 3 --augmentation-ramp-end 15 --workers 16 --device cuda --amp
 ```
 
 建议在云端新建干净环境后安装 `requirements.txt`。模型从头训练，不依赖 torchvision，也不会下载任何外部权重。
@@ -157,6 +157,8 @@ python train.py --data-root cxr_first --output-dir outputs/multiscale --epochs 5
 训练损失恢复为 v1 的未加权 `BCEWithLogitsLoss`，训练和验证 loss 使用相同口径。局部注意力输入由 v1 的每张图 4 个 token 增加为 16 个 token。
 
 模型默认 `dropout=0.0`，交叉注意力、注意力残差和前馈网络中的 dropout 均关闭；如需重新启用，可显式传入例如 `--dropout 0.1`。
+
+训练集默认启用渐进增强：第 1～3 轮保持轻度增强，第 4～15 轮线性增加强度，第 15 轮后保持上限。轻度到完整强度依次覆盖旋转 `±2°→±7°`、平移 `±1%→±4%`、缩放 `0.99～1.01→0.95～1.05`、亮度 `0.98～1.02→0.90～1.10`、对比度 `0.98～1.02→0.85～1.15` 和 Gamma `1.0→0.90～1.10`。所有变换均在生成全局图和四个局部块之前执行；验证集及训练集定期评估不做增强。日志中的 `augmentation_strength` 从 `0.0` 线性增加到 `1.0`。可用 `--no-progressive-augment` 恢复旧版固定增强。
 
 默认每隔 5 轮额外关闭数据增强并以 `eval()` 模式完整评估一次训练集，记录 `train_eval_loss`、`train_macro_auc`、`train_per_class_auc`、训练集 AP 和 F1；未到评估轮次时这些字段为 `null`。验证集字段仍为 `loss`、`macro_auc` 和 `per_class_auc`，`best.pt` 仍只按验证集 `macro_auc` 选择。可用 `--train-eval-interval 0` 关闭训练集评估。
 
@@ -192,10 +194,12 @@ python predict.py --checkpoint outputs/multiscale/20261024_153012/best.pt --data
 v1.0 20261024_222916   epoch22 0.769
 v2.0 增加2*2网格局部输入精度320->512 
 v3.0 回退到1.0精度处理不变，去掉结构化数据图片长宽和长宽比，启用裁剪后的 sqrt_ratio pos_weight
-v4.0 恢复 v1 元数据与未加权 BCE；每个局部块保留 2×2 特征，四块共 16 个局部 token
+v4.0 恢复 v1 元数据与未加权 BCE；每个局部块保留 2×2 特征，四块共 16 个局部 token         epoch26 0.752
 python train.py --data-root cxr_first --output-dir outputs/multiscale \
   --epochs 50 --image-size 320 --local-canvas-size 640 \
   --local-token-grid 2 --feature-dim 128 \
   --batch-size 64 --accum-studies 64 \
   --train-eval-interval 5 \
   --workers 12 --device cuda --amp
+v4.1 --dropout 0.1   epoch21 0.7684
+v4.2 在 v4.1 基础上增加第 3～15 轮渐进增强
