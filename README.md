@@ -231,3 +231,28 @@ python predict.py --checkpoint outputs/multiscale_v5/运行目录/best.pt \
   --data-root cxr_first --device cuda --amp \
   --attention-output outputs/predictions/v5_attention_views.csv
 ```
+v6.0 回退到 v4.2 网络结构：移除 v5.0 的逐图 global token，恢复每图 16 个局部
+token 进入类别查询注意力，以及全局特征与元数据的 Study 均值 residual。保留
+`--dropout 0.1` 和第 3～15 轮渐进增强，并默认启用标签数量采样课程：
+
+| 阶段 | No Finding | 单标签 | 双标签 | ≥3 标签 |
+| --- | ---: | ---: | ---: | ---: |
+| epoch 1～3 | 30% | 50% | 15% | 5% |
+| epoch 4～15 | 线性过渡 | 线性下降 | 线性增加 | 线性增加 |
+| epoch 16 以后 | 36.1% | 26.5% | 19.8% | 17.6% |
+
+epoch 1～15 每轮保持与训练集相同的 Study 数，按目标比例进行分层抽样；epoch 16
+以后恢复全训练集无放回随机遍历。验证集和定期 train-eval 始终使用原始分布。
+`metrics.jsonl` 与 `metrics.csv` 会记录每组目标概率和实际抽样数量。可使用
+`--no-label-cardinality-curriculum` 做自然采样对照。
+
+```bash
+python train.py --data-root cxr_first --output-dir outputs/multiscale_v6 \
+  --epochs 50 --image-size 320 --local-canvas-size 640 \
+  --local-token-grid 2 --feature-dim 128 --dropout 0.1 \
+  --label-cardinality-curriculum \
+  --label-curriculum-ramp-start 3 --label-curriculum-ramp-end 15 \
+  --batch-size 64 --accum-studies 64 \
+  --progressive-augment --augmentation-ramp-start 3 --augmentation-ramp-end 15 \
+  --train-eval-interval 5 --workers 12 --device cuda --amp
+```
