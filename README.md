@@ -149,16 +149,18 @@ python audit_data.py --data-root cxr_first --output data_audit.json
 云端正式训练示例：
 
 ```bash
-python train.py --data-root cxr_first --output-dir outputs/multiscale --epochs 50 --image-size 320 --local-canvas-size 640 --local-token-grid 2 --feature-dim 128 --dropout 0.1 --batch-size 64 --accum-studies 64 --progressive-augment --dynamic-imaging-augment --augmentation-ramp-start 3 --augmentation-ramp-end 15 --workers 16 --device cuda --amp
+python train.py --data-root cxr_first --output-dir outputs/multiscale_v8 --epochs 50 --image-size 320 --local-canvas-size 640 --local-token-grid 2 --feature-dim 128 --dropout 0.1 --batch-size 64 --accum-studies 64 --progressive-augment --augmentation-ramp-start 3 --augmentation-ramp-end 15 --ranking-loss-weight 0.1 --ranking-loss-margin 0.2 --hard-negative-fraction 0.25 --ranking-ramp-start 5 --ranking-ramp-end 15 --workers 16 --device cuda --amp
 ```
 
 建议在云端新建干净环境后安装 `requirements.txt`。模型从头训练，不依赖 torchvision，也不会下载任何外部权重。
 
-训练损失恢复为 v1 的未加权 `BCEWithLogitsLoss`，训练和验证 loss 使用相同口径。局部注意力输入由 v1 的每张图 4 个 token 增加为 16 个 token。
+训练目标为未加权 `BCEWithLogitsLoss + 类别级困难排序损失`。验证 loss 仍只计算 BCE，因而可与 v4.2 直接比较；训练日志分别记录 `train_bce_loss`、`train_ranking_loss` 和加权后的 `train_loss`。局部注意力输入与 v4.2 相同，每张图保留 16 个 token。
 
 模型默认 `dropout=0.0`，交叉注意力、注意力残差和前馈网络中的 dropout 均关闭；如需重新启用，可显式传入例如 `--dropout 0.1`。
 
-训练集默认启用 v7 动态成像增强：第 1～3 轮保持轻度增强，第 4～15 轮线性增加强度，第 15 轮后保持上限。每次读取随机保留原图，或从仿射、亮度、对比度和 Gamma 中选择不同组合；随课程强度增加，再逐步加入分辨率退化、轻微高斯噪声、模糊或锐化。完整强度的几何范围限制为旋转 `±5°`、平移 `±3%`、缩放 `0.97～1.03`，避免继续扩大几何形变破坏小病灶。验证集及训练集定期评估不做增强。日志中的 `augmentation_strength` 从 `0.0` 线性增加到 `1.0`。可用 `--no-dynamic-imaging-augment` 恢复 v4.2 的固定组合渐进增强。
+训练集恢复 v4.2 的固定组合渐进增强：第 1～3 轮为轻度增强，第 4～15 轮线性增加强度，第 15 轮后保持上限。完整强度为旋转 `±7°`、平移 `±4%`、缩放 `0.95～1.05`、亮度 `0.90～1.10`、对比度 `0.85～1.15` 和 Gamma `0.90～1.10`。验证集及训练集定期评估不做增强，日志中的 `augmentation_strength` 从 `0.0` 线性增加到 `1.0`。
+
+困难排序以类别为单位，在每个 micro-batch 内把该类全部阳性与预测分数最高的 25% 阴性组成样本对，使用带 margin 的平滑排序损失；先对每类样本对取平均，再对有效类别做宏平均，避免高频类别主导。排序权重第 1～5 轮为 0，第 6～15 轮线性增加到 0.1。该损失要求 `--batch-size >= 2`，建议正式训练保持 64；梯度累积不会把不同 micro-batch 拼成排序样本对。`ranking_effective_classes` 和 `ranking_pairs_per_batch` 可用于检查每轮是否形成了足够多的有效排序对。
 
 默认每隔 5 轮额外关闭数据增强并以 `eval()` 模式完整评估一次训练集，记录 `train_eval_loss`、`train_macro_auc`、`train_per_class_auc`、训练集 AP 和 F1；未到评估轮次时这些字段为 `null`。验证集字段仍为 `loss`、`macro_auc` 和 `per_class_auc`，`best.pt` 仍只按验证集 `macro_auc` 选择。可用 `--train-eval-interval 0` 关闭训练集评估。
 
@@ -271,3 +273,42 @@ python train.py --data-root cxr_first --output-dir outputs/multiscale_v7 \
   --augmentation-ramp-start 3 --augmentation-ramp-end 15 \
   --train-eval-interval 5 --workers 12 --device cuda --amp
 ```
+
+v8.0 回退到 v4.2 的网络结构、自然采样和固定组合渐进增强，并将训练目标改为
+`BCE + 类别级困难排序损失`。对每个类别选取当前得分最高的 25% 阴性作为 hard
+negatives，与 batch 内该类全部阳性比较；类别内平均后再对有效类别宏平均。排序权重
+在第 6～15 轮由 0 线性增加到 0.1，避免训练早期不稳定。验证 loss 保持纯 BCE。
+
+从头训练（推荐作为主对照）：
+
+```bash
+python train.py --data-root cxr_first --output-dir outputs/multiscale_v8 \
+  --epochs 50 --image-size 320 --local-canvas-size 640 \
+  --local-token-grid 2 --feature-dim 128 --dropout 0.1 \
+  --batch-size 64 --accum-studies 64 \
+  --progressive-augment --augmentation-ramp-start 3 --augmentation-ramp-end 15 \
+  --ranking-loss-weight 0.1 --ranking-loss-margin 0.2 \
+  --hard-negative-fraction 0.25 --ranking-ramp-start 5 --ranking-ramp-end 15 \
+  --train-eval-interval 5 --workers 12 --device cuda --amp
+```
+
+可用 v4.2 的 `best.pt` 做同结构热启动。`--init-checkpoint` 只载入模型权重，并重置
+优化器、学习率调度器和 epoch；它与继续旧训练状态的 `--resume` 不同且不能同时使用。
+建议把热启动作为第二组实验，降低学习率并缩短训练，而不是再以 `3e-4` 完整训练 50 轮：
+
+```bash
+python train.py --data-root cxr_first --output-dir outputs/multiscale_v8_from_v42 \
+  --epochs 10 --image-size 320 --local-canvas-size 640 \
+  --local-token-grid 2 --feature-dim 128 --dropout 0.1 \
+  --batch-size 64 --accum-studies 64 --lr 3e-5 --warmup-epochs 0.5 \
+  --progressive-augment --augmentation-ramp-start 3 --augmentation-ramp-end 15 \
+  --ranking-loss-weight 0.1 --ranking-loss-margin 0.2 \
+  --hard-negative-fraction 0.25 --ranking-ramp-start 0 --ranking-ramp-end 2 \
+  --init-checkpoint outputs/multiscale_v42/best.pt \
+  --train-eval-interval 5 --workers 12 --device cuda --amp
+```
+
+热启动要求类别顺序、图像尺寸、局部 token 网格、特征维度、dropout 和预处理配置
+与 v4.2 checkpoint 完全一致，代码会在不兼容时直接报错。由于该权重已见过同一训练集，
+严格说它是 fine-tuning/warm start，而不是独立数据预训练；应与从头训练使用相同划分和
+随机种子比较，并以验证集 Macro-AUC 判断是否真正改善泛化。

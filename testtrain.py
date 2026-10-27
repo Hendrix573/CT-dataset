@@ -25,7 +25,7 @@ if __name__ == "__main__":
         "--local-canvas-size", "128",
         "--local-token-grid", "2",
         "--progressive-augment",
-        "--batch-size", "1",
+        "--batch-size", "2",
         "--accum-studies", "2",
         "--train-eval-interval", "1",
         "--workers", "0",

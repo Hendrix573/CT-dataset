@@ -72,6 +72,11 @@ def append_metrics(run_dir: Path, report: dict) -> None:
         "time": safe_report["time"], "epoch": safe_report["epoch"],
         "optimizer_step": safe_report["optimizer_step"], "learning_rate": safe_report["learning_rate"],
         "train_loss": safe_report["train_loss"],
+        "train_bce_loss": safe_report["train_bce_loss"],
+        "train_ranking_loss": safe_report["train_ranking_loss"],
+        "ranking_loss_weight": safe_report["ranking_loss_weight"],
+        "ranking_effective_classes": safe_report["ranking_effective_classes"],
+        "ranking_pairs_per_batch": safe_report["ranking_pairs_per_batch"],
         "train_eval_loss": safe_report["train_eval_loss"],
         "train_macro_auc": safe_report["train_macro_auc"],
         "train_auc_classes": safe_report["train_auc_classes"],
@@ -118,19 +123,20 @@ def parse_args(argv=None):
         help="Spatial token grid retained inside each of the four local patches",
     )
     parser.add_argument("--dropout", type=float, default=0.0)
-    parser.add_argument("--batch-size", type=int, default=1, help="Studies per micro-batch")
+    parser.add_argument("--batch-size", type=int, default=2, help="Studies per micro-batch")
     parser.add_argument("--accum-studies", type=int, default=16)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--warmup-epochs", type=float, default=3.0)
+    parser.add_argument("--ranking-loss-weight", type=float, default=0.1)
+    parser.add_argument("--ranking-loss-margin", type=float, default=0.2)
+    parser.add_argument("--hard-negative-fraction", type=float, default=0.25)
+    parser.add_argument("--ranking-ramp-start", type=int, default=5)
+    parser.add_argument("--ranking-ramp-end", type=int, default=15)
     parser.add_argument(
         "--progressive-augment", action=argparse.BooleanOptionalAction, default=True,
         help="Ramp conservative CXR augmentation from mild to full strength",
-    )
-    parser.add_argument(
-        "--dynamic-imaging-augment", action=argparse.BooleanOptionalAction, default=True,
-        help="Randomly compose exposure and acquisition-style augmentations",
     )
     parser.add_argument("--augmentation-ramp-start", type=int, default=3)
     parser.add_argument("--augmentation-ramp-end", type=int, default=15)
@@ -145,6 +151,10 @@ def parse_args(argv=None):
     parser.add_argument("--max-valid-studies", type=int)
     parser.add_argument("--max-images-per-study", type=int)
     parser.add_argument("--resume", type=Path)
+    parser.add_argument(
+        "--init-checkpoint", type=Path,
+        help="Load compatible model weights but start a new optimizer and LR schedule",
+    )
     return parser.parse_args(argv)
 
 
@@ -194,27 +204,89 @@ def optimizer_step(model, optimizer, scaler, accumulated_studies, amp_enabled):
     optimizer.zero_grad(set_to_none=True)
 
 
-def train_epoch(model, loader, optimizer, scheduler, scaler, device, args):
+def ranking_loss_weight_for_epoch(args, epoch):
+    if not args.ranking_loss_weight or epoch <= args.ranking_ramp_start:
+        return 0.0
+    if epoch >= args.ranking_ramp_end:
+        return args.ranking_loss_weight
+    progress = (epoch - args.ranking_ramp_start) / (
+        args.ranking_ramp_end - args.ranking_ramp_start
+    )
+    return args.ranking_loss_weight * progress
+
+
+def classwise_hard_ranking_loss(logits, targets, margin, hard_negative_fraction):
+    """Macro-average positive-vs-hard-negative ranking loss over valid classes."""
+    class_losses = []
+    pair_count = 0
+    for class_index in range(logits.shape[1]):
+        class_logits = logits[:, class_index]
+        class_targets = targets[:, class_index] > 0.5
+        positive_logits = class_logits[class_targets]
+        negative_logits = class_logits[~class_targets]
+        if positive_logits.numel() == 0 or negative_logits.numel() == 0:
+            continue
+        hard_count = max(1, math.ceil(
+            negative_logits.numel() * hard_negative_fraction
+        ))
+        hard_negatives = negative_logits.topk(hard_count).values
+        pair_losses = F.softplus(
+            margin - positive_logits[:, None] + hard_negatives[None, :]
+        )
+        class_losses.append(pair_losses.mean())
+        pair_count += pair_losses.numel()
+    if not class_losses:
+        return logits.sum() * 0.0, 0, 0
+    return torch.stack(class_losses).mean(), len(class_losses), pair_count
+
+
+def train_epoch(model, loader, optimizer, scheduler, scaler, device, args,
+                ranking_weight):
     model.train()
     optimizer.zero_grad(set_to_none=True)
     amp_enabled = args.amp and device.type == "cuda"
-    total_loss = 0.0
+    total_loss = total_bce = total_ranking = 0.0
+    effective_class_total = pair_total = ranking_batch_count = 0
     seen_studies = accumulated = 0
     for batch_index, batch in enumerate(loader):
         model_batch, targets = move_batch(batch, device)
         study_count = int(batch["num_studies"])
         with torch.cuda.amp.autocast(enabled=amp_enabled):
             logits = model(model_batch)["logits"]
-            loss = F.binary_cross_entropy_with_logits(logits, targets)
+            bce_loss = F.binary_cross_entropy_with_logits(logits, targets)
+            if ranking_weight:
+                ranking_loss, effective_classes, pair_count = classwise_hard_ranking_loss(
+                    logits.float(), targets,
+                    args.ranking_loss_margin, args.hard_negative_fraction,
+                )
+            else:
+                ranking_loss = logits.sum() * 0.0
+                effective_classes = pair_count = 0
+            loss = bce_loss + ranking_weight * ranking_loss
         scaler.scale(loss * study_count).backward()
         total_loss += loss.item() * study_count
+        total_bce += bce_loss.item() * study_count
+        total_ranking += ranking_loss.item() * study_count
+        effective_class_total += effective_classes
+        pair_total += pair_count
+        ranking_batch_count += int(effective_classes > 0)
         seen_studies += study_count
         accumulated += study_count
         if accumulated >= args.accum_studies or batch_index + 1 == len(loader):
             optimizer_step(model, optimizer, scaler, accumulated, amp_enabled)
             scheduler.step()
             accumulated = 0
-    return total_loss / max(1, seen_studies)
+    return {
+        "loss": total_loss / max(1, seen_studies),
+        "bce_loss": total_bce / max(1, seen_studies),
+        "ranking_loss": total_ranking / max(1, seen_studies),
+        "ranking_effective_classes": (
+            effective_class_total / ranking_batch_count if ranking_batch_count else 0.0
+        ),
+        "ranking_pairs_per_batch": (
+            pair_total / ranking_batch_count if ranking_batch_count else 0.0
+        ),
+    }
 
 
 @torch.inference_mode()
@@ -269,7 +341,6 @@ def preprocessing_config(args):
         "quadrants": ["image-left-upper", "image-right-upper", "image-left-lower", "image-right-lower"],
         "training_augmentation": {
             "progressive": args.progressive_augment,
-            "dynamic_imaging": args.dynamic_imaging_augment,
             "ramp_start_epoch": args.augmentation_ramp_start,
             "ramp_end_epoch": args.augmentation_ramp_end,
             "mild": {
@@ -278,22 +349,9 @@ def preprocessing_config(args):
                 "contrast": [0.98, 1.02], "gamma": [1.0, 1.0],
             },
             "full": {
-                "rotation_degrees": 5.0 if args.dynamic_imaging_augment else 7.0,
-                "translation_fraction": 0.03 if args.dynamic_imaging_augment else 0.04,
-                "scale": ([0.97, 1.03] if args.dynamic_imaging_augment else [0.95, 1.05]),
-                "brightness": [0.90, 1.10],
+                "rotation_degrees": 7.0, "translation_fraction": 0.04,
+                "scale": [0.95, 1.05], "brightness": [0.90, 1.10],
                 "contrast": [0.85, 1.15], "gamma": [0.90, 1.10],
-            },
-            "dynamic_policy": {
-                "clean_probability": [0.30, 0.15],
-                "affine_probability": [0.50, 0.70],
-                "exposure_operations_per_image": [1, 2],
-                "resolution_degradation_probability": [0.0, 0.20],
-                "resolution_scale_at_full_strength": [0.65, 0.95],
-                "gaussian_noise_probability": [0.0, 0.25],
-                "gaussian_noise_std": [0.005, 0.025],
-                "blur_probability": [0.0, 0.10],
-                "sharpen_probability": [0.0, 0.10],
             },
         },
     }
@@ -321,7 +379,9 @@ def save_checkpoint(path, model, optimizer, scheduler, scaler, epoch, best_auc, 
         "best_macro_auc": best_auc, "class_names": list(CLASS_NAMES),
         "preprocessing": preprocessing_config(args), "architecture": architecture_config(args),
         "config": vars(args) | {"data_root": str(args.data_root), "output_dir": str(args.output_dir),
-                                  "resume": str(args.resume) if args.resume else None},
+                                  "resume": str(args.resume) if args.resume else None,
+                                  "init_checkpoint": (str(args.init_checkpoint)
+                                                      if args.init_checkpoint else None)},
         "torch_rng_state": torch.get_rng_state(), "python_rng_state": random.getstate(),
     }
     if torch.cuda.is_available():
@@ -348,14 +408,42 @@ def restore_checkpoint(path, model, optimizer, scheduler, scaler, args):
     return int(checkpoint["epoch"]) + 1, float(checkpoint["best_macro_auc"])
 
 
+def initialize_model(path, model, args):
+    """Load compatible model weights without importing optimizer or scheduler state."""
+    checkpoint = torch.load(path, map_location="cpu")
+    if checkpoint.get("class_names") != list(CLASS_NAMES):
+        raise ValueError("initialization checkpoint class order mismatch")
+    if checkpoint.get("preprocessing") != preprocessing_config(args):
+        raise ValueError("initialization checkpoint preprocessing differs from current arguments")
+    if checkpoint.get("architecture") != architecture_config(args):
+        raise ValueError("initialization checkpoint architecture differs from current arguments")
+    model.load_state_dict(checkpoint["model"])
+    return int(checkpoint.get("epoch", 0)), float(checkpoint.get("best_macro_auc", math.nan))
+
+
 def main(argv=None):
     args = parse_args(argv)
+    if args.resume and args.init_checkpoint:
+        raise ValueError("--resume and --init-checkpoint are mutually exclusive")
     if args.local_canvas_size % 2:
         raise ValueError("--local-canvas-size must be even")
     if args.local_token_grid < 1:
         raise ValueError("--local-token-grid must be positive")
     if args.train_eval_interval < 0:
         raise ValueError("--train-eval-interval must be non-negative")
+    if args.ranking_loss_weight < 0:
+        raise ValueError("--ranking-loss-weight must be non-negative")
+    if args.ranking_loss_margin < 0:
+        raise ValueError("--ranking-loss-margin must be non-negative")
+    if not 0 < args.hard_negative_fraction <= 1:
+        raise ValueError("--hard-negative-fraction must be in (0, 1]")
+    if args.ranking_loss_weight:
+        if args.batch_size < 2:
+            raise ValueError("ranking loss requires --batch-size of at least 2")
+        if args.ranking_ramp_start < 0:
+            raise ValueError("--ranking-ramp-start must be non-negative")
+        if args.ranking_ramp_end <= args.ranking_ramp_start:
+            raise ValueError("--ranking-ramp-end must be greater than ramp start")
     if args.progressive_augment:
         if args.augmentation_ramp_start < 0:
             raise ValueError("--augmentation-ramp-start must be non-negative")
@@ -371,6 +459,10 @@ def main(argv=None):
             raise FileNotFoundError(f"resume checkpoint does not exist: {args.resume}")
         run_dir = args.resume.resolve().parent
     else:
+        if args.init_checkpoint and not args.init_checkpoint.is_file():
+            raise FileNotFoundError(
+                f"initialization checkpoint does not exist: {args.init_checkpoint}"
+            )
         run_dir = create_timestamped_run_dir(args.output_dir)
     args.output_dir = run_dir
     common = dict(image_size=args.image_size, local_canvas_size=args.local_canvas_size,
@@ -379,9 +471,7 @@ def main(argv=None):
                               augment=True, max_studies=args.max_train_studies,
                               progressive_augment=args.progressive_augment,
                               augmentation_ramp_start=args.augmentation_ramp_start,
-                              augmentation_ramp_end=args.augmentation_ramp_end,
-                              dynamic_imaging_augment=args.dynamic_imaging_augment,
-                              **common)
+                              augmentation_ramp_end=args.augmentation_ramp_end, **common)
     train_eval_data = None
     if args.train_eval_interval:
         # This creates only a compact CSV index; image pixels are still loaded on demand.
@@ -402,6 +492,13 @@ def main(argv=None):
     model = StudyMultiInputNet(args.feature_dim, args.metadata_dim,
                                args.attention_heads, args.dropout,
                                args.local_token_grid).to(device)
+    initialized_from = None
+    if args.init_checkpoint:
+        source_epoch, source_auc = initialize_model(args.init_checkpoint, model, args)
+        initialized_from = {
+            "path": str(args.init_checkpoint), "epoch": source_epoch,
+            "best_macro_auc": source_auc,
+        }
     optimizer = make_optimizer(model, args)
     updates_per_epoch = max(1, math.ceil(len(train_data) / args.accum_studies))
     total_updates = max(1, updates_per_epoch * args.epochs)
@@ -422,19 +519,30 @@ def main(argv=None):
         )
     parameter_count = sum(p.numel() for p in model.parameters())
     write_run_config(run_dir, args, device, parameter_count, len(train_data), len(valid_data))
-    print(json.dumps({"run_dir": str(run_dir), "device": str(device), "parameters": parameter_count,
-                      "train_studies": len(train_data), "valid_studies": len(valid_data),
-                      "local_tokens_per_image": 4 * args.local_token_grid ** 2,
-                      "progressive_augment": args.progressive_augment,
-                      "dynamic_imaging_augment": args.dynamic_imaging_augment,
-                      "augmentation_ramp": [args.augmentation_ramp_start,
-                                             args.augmentation_ramp_end]}))
+    startup_report = {
+        "run_dir": str(run_dir), "device": str(device), "parameters": parameter_count,
+        "train_studies": len(train_data), "valid_studies": len(valid_data),
+        "local_tokens_per_image": 4 * args.local_token_grid ** 2,
+        "loss": {
+            "bce": True,
+            "ranking_weight": args.ranking_loss_weight,
+            "ranking_margin": args.ranking_loss_margin,
+            "hard_negative_fraction": args.hard_negative_fraction,
+            "ranking_ramp": [args.ranking_ramp_start, args.ranking_ramp_end],
+        },
+        "initialized_from": initialized_from,
+        "progressive_augment": args.progressive_augment,
+        "augmentation_ramp": [args.augmentation_ramp_start, args.augmentation_ramp_end],
+    }
+    print(json.dumps(json_safe(startup_report), ensure_ascii=False, allow_nan=False))
     for epoch in range(start_epoch, args.epochs + 1):
         epoch_started = time.perf_counter()
         train_data.set_epoch(epoch)
         augmentation_strength = train_data.augmentation_strength
-        train_loss = train_epoch(
-            model, train_loader, optimizer, scheduler, scaler, device, args
+        ranking_weight = ranking_loss_weight_for_epoch(args, epoch)
+        train_metrics = train_epoch(
+            model, train_loader, optimizer, scheduler, scaler, device, args,
+            ranking_weight,
         )
         train_eval_metrics = None
         if train_eval_loader is not None and epoch % args.train_eval_interval == 0:
@@ -449,7 +557,12 @@ def main(argv=None):
             "epoch": epoch,
             "optimizer_step": scheduler.last_epoch,
             "learning_rate": scheduler.get_last_lr()[0],
-            "train_loss": train_loss,
+            "train_loss": train_metrics["loss"],
+            "train_bce_loss": train_metrics["bce_loss"],
+            "train_ranking_loss": train_metrics["ranking_loss"],
+            "ranking_loss_weight": ranking_weight,
+            "ranking_effective_classes": train_metrics["ranking_effective_classes"],
+            "ranking_pairs_per_batch": train_metrics["ranking_pairs_per_batch"],
             "augmentation_strength": augmentation_strength,
             **training_evaluation_report(train_eval_metrics),
             **metrics,
