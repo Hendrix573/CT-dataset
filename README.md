@@ -61,7 +61,7 @@ Pleural Effusion
 10
 无异常发现
 No Finding
-(10与前九个互斥)
+
 
 ## 相关字段说明
 
@@ -106,7 +106,7 @@ No Finding
 
 Subject_id  Study_id Predict_class Probability
 100001       0000001       1          0.92
-100001       0000001       6          0.87
+100001       0000001       2          0.87
 
 
 说明：
