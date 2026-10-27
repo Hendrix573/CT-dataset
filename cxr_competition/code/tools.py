@@ -39,7 +39,7 @@ def download(args):
     torch.save(m.state_dict(), path)
     fam = next((k for k in LICENSES if args.backbone.startswith(k)), None)
     info = dict(backbone=args.backbone, file=os.path.basename(path), sha256=sha256(path),
-                hf_hub_id=cfg.get("hf_hub_id"), url=f"https://ghfast.top/https://huggingface.co/{cfg.get('hf_hub_id')}",
+                hf_hub_id=cfg.get("hf_hub_id"), url=f"https://huggingface.co/{cfg.get('hf_hub_id')}",
                 license=cfg.get("license") or (LICENSES[fam][0] if fam else "请核对 model card"),
                 pretrain_data=LICENSES[fam][1] if fam else "请核对 model card",
                 paper=cfg.get("paper_ids"))
