@@ -149,7 +149,7 @@ python audit_data.py --data-root cxr_first --output data_audit.json
 云端正式训练示例：
 
 ```bash
-python train.py --data-root cxr_first --output-dir outputs/multiscale --epochs 50 --image-size 320 --local-canvas-size 640 --local-token-grid 2 --feature-dim 128 --dropout 0.1 --batch-size 64 --accum-studies 64 --progressive-augment --augmentation-ramp-start 3 --augmentation-ramp-end 15 --workers 16 --device cuda --amp
+python train.py --data-root cxr_first --output-dir outputs/multiscale --epochs 50 --image-size 320 --local-canvas-size 640 --local-token-grid 2 --feature-dim 128 --dropout 0.1 --batch-size 64 --accum-studies 64 --progressive-augment --dynamic-imaging-augment --augmentation-ramp-start 3 --augmentation-ramp-end 15 --workers 16 --device cuda --amp
 ```
 
 建议在云端新建干净环境后安装 `requirements.txt`。模型从头训练，不依赖 torchvision，也不会下载任何外部权重。
@@ -158,7 +158,7 @@ python train.py --data-root cxr_first --output-dir outputs/multiscale --epochs 5
 
 模型默认 `dropout=0.0`，交叉注意力、注意力残差和前馈网络中的 dropout 均关闭；如需重新启用，可显式传入例如 `--dropout 0.1`。
 
-训练集默认启用渐进增强：第 1～3 轮保持轻度增强，第 4～15 轮线性增加强度，第 15 轮后保持上限。轻度到完整强度依次覆盖旋转 `±2°→±7°`、平移 `±1%→±4%`、缩放 `0.99～1.01→0.95～1.05`、亮度 `0.98～1.02→0.90～1.10`、对比度 `0.98～1.02→0.85～1.15` 和 Gamma `1.0→0.90～1.10`。所有变换均在生成全局图和四个局部块之前执行；验证集及训练集定期评估不做增强。日志中的 `augmentation_strength` 从 `0.0` 线性增加到 `1.0`。可用 `--no-progressive-augment` 恢复旧版固定增强。
+训练集默认启用 v7 动态成像增强：第 1～3 轮保持轻度增强，第 4～15 轮线性增加强度，第 15 轮后保持上限。每次读取随机保留原图，或从仿射、亮度、对比度和 Gamma 中选择不同组合；随课程强度增加，再逐步加入分辨率退化、轻微高斯噪声、模糊或锐化。完整强度的几何范围限制为旋转 `±5°`、平移 `±3%`、缩放 `0.97～1.03`，避免继续扩大几何形变破坏小病灶。验证集及训练集定期评估不做增强。日志中的 `augmentation_strength` 从 `0.0` 线性增加到 `1.0`。可用 `--no-dynamic-imaging-augment` 恢复 v4.2 的固定组合渐进增强。
 
 默认每隔 5 轮额外关闭数据增强并以 `eval()` 模式完整评估一次训练集，记录 `train_eval_loss`、`train_macro_auc`、`train_per_class_auc`、训练集 AP 和 F1；未到评估轮次时这些字段为 `null`。验证集字段仍为 `loss`、`macro_auc` 和 `per_class_auc`，`best.pt` 仍只按验证集 `macro_auc` 选择。可用 `--train-eval-interval 0` 关闭训练集评估。
 
@@ -254,5 +254,20 @@ python train.py --data-root cxr_first --output-dir outputs/multiscale_v6 \
   --label-curriculum-ramp-start 3 --label-curriculum-ramp-end 15 \
   --batch-size 64 --accum-studies 64 \
   --progressive-augment --augmentation-ramp-start 3 --augmentation-ramp-end 15 \
+  --train-eval-interval 5 --workers 12 --device cuda --amp
+```
+
+v7.0 再次回退到 v4.2 的网络、自然采样和未加权 BCE，仅将固定组合渐进增强替换为
+动态成像增强。完整强度下保留 15% 原图，仿射以 70% 概率执行，曝光增强每次随机
+选择 1～2 项；分辨率退化、噪声、模糊和锐化的概率分别渐进至 20%、25%、10%
+和 10%。模糊与锐化互斥，且不使用水平翻转、随机擦除或 CutMix。
+
+```bash
+python train.py --data-root cxr_first --output-dir outputs/multiscale_v7 \
+  --epochs 50 --image-size 320 --local-canvas-size 640 \
+  --local-token-grid 2 --feature-dim 128 --dropout 0.1 \
+  --batch-size 64 --accum-studies 64 \
+  --progressive-augment --dynamic-imaging-augment \
+  --augmentation-ramp-start 3 --augmentation-ramp-end 15 \
   --train-eval-interval 5 --workers 12 --device cuda --amp
 ```

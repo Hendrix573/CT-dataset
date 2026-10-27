@@ -11,112 +11,13 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Sampler
+from torch.utils.data import DataLoader
 
 from cxr_baseline import CLASS_NAMES, StudyDataset, StudyMultiInputNet, collate_studies
 from cxr_baseline.metrics import multilabel_metrics
 
 
 CHINA_TIMEZONE = timezone(timedelta(hours=8), name="Asia/Shanghai")
-
-CURRICULUM_GROUP_NAMES = ("no_finding", "single", "double", "three_or_more")
-CURRICULUM_START_PROBABILITIES = (0.30, 0.50, 0.15, 0.05)
-CURRICULUM_FINAL_PROBABILITIES = (0.361, 0.265, 0.198, 0.176)
-
-
-class LabelCardinalityCurriculumSampler(Sampler):
-    """Sample Studies from easy label cardinalities before restoring natural sampling."""
-
-    def __init__(self, dataset, seed=42, ramp_start=3, ramp_end=15):
-        self.dataset = dataset
-        self.seed = seed
-        self.ramp_start = ramp_start
-        self.ramp_end = ramp_end
-        self.epoch = 1
-        self.groups = [[] for _ in CURRICULUM_GROUP_NAMES]
-        for index, record in enumerate(dataset.records):
-            disease_count = int(record.targets[:9].sum().item())
-            group_index = 0 if disease_count == 0 else min(disease_count, 3)
-            self.groups[group_index].append(index)
-        if not any(self.groups):
-            raise ValueError("label-cardinality curriculum found no training Studies")
-        self.last_sampled_counts = None
-
-    def set_epoch(self, epoch):
-        self.epoch = epoch
-
-    @property
-    def target_probabilities(self):
-        if self.epoch <= self.ramp_start:
-            probabilities = CURRICULUM_START_PROBABILITIES
-        elif self.epoch >= self.ramp_end:
-            probabilities = CURRICULUM_FINAL_PROBABILITIES
-        else:
-            progress = (self.epoch - self.ramp_start) / (self.ramp_end - self.ramp_start)
-            probabilities = tuple(
-                start + (final - start) * progress
-                for start, final in zip(
-                    CURRICULUM_START_PROBABILITIES, CURRICULUM_FINAL_PROBABILITIES
-                )
-            )
-        # Tiny development subsets may not contain all groups. Redistribute their
-        # probability over the groups that are present.
-        active = [probability if group else 0.0
-                  for probability, group in zip(probabilities, self.groups)]
-        total = sum(active)
-        return tuple(probability / total for probability in active)
-
-    @staticmethod
-    def _quota_counts(total, probabilities):
-        exact = [total * probability for probability in probabilities]
-        counts = [math.floor(value) for value in exact]
-        remainder = total - sum(counts)
-        order = sorted(range(len(exact)), key=lambda i: exact[i] - counts[i], reverse=True)
-        for index in order[:remainder]:
-            counts[index] += 1
-        return counts
-
-    @staticmethod
-    def _sample_group(pool, count, generator):
-        if count == 0:
-            return torch.empty(0, dtype=torch.long)
-        pool_tensor = torch.tensor(pool, dtype=torch.long)
-        if count <= len(pool):
-            return pool_tensor[torch.randperm(len(pool), generator=generator)[:count]]
-        # Include every Study once before drawing the oversampled remainder.
-        first_pass = pool_tensor[torch.randperm(len(pool), generator=generator)]
-        extra = pool_tensor[torch.randint(
-            len(pool), (count - len(pool),), generator=generator
-        )]
-        return torch.cat((first_pass, extra))
-
-    def __iter__(self):
-        generator = torch.Generator().manual_seed(self.seed + self.epoch * 1_000_003)
-        if self.epoch > self.ramp_end:
-            indices = torch.randperm(len(self.dataset), generator=generator)
-            counts = [len(group) for group in self.groups]
-        else:
-            counts = self._quota_counts(len(self.dataset), self.target_probabilities)
-            parts = [
-                self._sample_group(pool, count, generator)
-                for pool, count in zip(self.groups, counts)
-            ]
-            indices = torch.cat(parts)
-            indices = indices[torch.randperm(len(indices), generator=generator)]
-        self.last_sampled_counts = tuple(counts)
-        return iter(indices.tolist())
-
-    def __len__(self):
-        return len(self.dataset)
-
-    def report(self):
-        counts = self.last_sampled_counts or tuple(0 for _ in CURRICULUM_GROUP_NAMES)
-        return {
-            "sampling_group_probabilities": dict(zip(
-                CURRICULUM_GROUP_NAMES, self.target_probabilities
-            )),
-            "sampled_group_counts": dict(zip(CURRICULUM_GROUP_NAMES, counts)),
-        }
 
 
 def create_timestamped_run_dir(root: Path) -> Path:
@@ -153,7 +54,6 @@ def write_run_config(run_dir, args, device, parameter_count, train_count, valid_
         "valid_studies": valid_count,
         "arguments": vars(args),
         "preprocessing": preprocessing_config(args),
-        "sampling_curriculum": sampling_curriculum_config(args),
         "architecture": architecture_config(args),
         "class_names": list(CLASS_NAMES),
     }
@@ -183,13 +83,6 @@ def append_metrics(run_dir: Path, report: dict) -> None:
         "macro_ap": safe_report["macro_ap"], "macro_f1_0.5": safe_report["macro_f1_0.5"],
         "best_macro_auc": safe_report["best_macro_auc"], "epoch_seconds": safe_report["epoch_seconds"],
     }
-    for group_name in CURRICULUM_GROUP_NAMES:
-        csv_row[f"sampling_probability_{group_name}"] = safe_report[
-            "sampling_group_probabilities"
-        ].get(group_name)
-        csv_row[f"sampled_count_{group_name}"] = safe_report[
-            "sampled_group_counts"
-        ].get(group_name)
     for index, value in enumerate(safe_report["per_class_auc"], start=1):
         csv_row[f"auc_{index}"] = value
     for index, value in enumerate(safe_report["per_class_ap"], start=1):
@@ -235,15 +128,12 @@ def parse_args(argv=None):
         "--progressive-augment", action=argparse.BooleanOptionalAction, default=True,
         help="Ramp conservative CXR augmentation from mild to full strength",
     )
+    parser.add_argument(
+        "--dynamic-imaging-augment", action=argparse.BooleanOptionalAction, default=True,
+        help="Randomly compose exposure and acquisition-style augmentations",
+    )
     parser.add_argument("--augmentation-ramp-start", type=int, default=3)
     parser.add_argument("--augmentation-ramp-end", type=int, default=15)
-    parser.add_argument(
-        "--label-cardinality-curriculum", action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Ramp Study sampling from single-label-heavy to the natural label distribution",
-    )
-    parser.add_argument("--label-curriculum-ramp-start", type=int, default=3)
-    parser.add_argument("--label-curriculum-ramp-end", type=int, default=15)
     parser.add_argument(
         "--train-eval-interval", type=int, default=5,
         help="Evaluate the augmentation-free training set every N epochs; 0 disables it",
@@ -379,6 +269,7 @@ def preprocessing_config(args):
         "quadrants": ["image-left-upper", "image-right-upper", "image-left-lower", "image-right-lower"],
         "training_augmentation": {
             "progressive": args.progressive_augment,
+            "dynamic_imaging": args.dynamic_imaging_augment,
             "ramp_start_epoch": args.augmentation_ramp_start,
             "ramp_end_epoch": args.augmentation_ramp_end,
             "mild": {
@@ -387,23 +278,24 @@ def preprocessing_config(args):
                 "contrast": [0.98, 1.02], "gamma": [1.0, 1.0],
             },
             "full": {
-                "rotation_degrees": 7.0, "translation_fraction": 0.04,
-                "scale": [0.95, 1.05], "brightness": [0.90, 1.10],
+                "rotation_degrees": 5.0 if args.dynamic_imaging_augment else 7.0,
+                "translation_fraction": 0.03 if args.dynamic_imaging_augment else 0.04,
+                "scale": ([0.97, 1.03] if args.dynamic_imaging_augment else [0.95, 1.05]),
+                "brightness": [0.90, 1.10],
                 "contrast": [0.85, 1.15], "gamma": [0.90, 1.10],
             },
+            "dynamic_policy": {
+                "clean_probability": [0.30, 0.15],
+                "affine_probability": [0.50, 0.70],
+                "exposure_operations_per_image": [1, 2],
+                "resolution_degradation_probability": [0.0, 0.20],
+                "resolution_scale_at_full_strength": [0.65, 0.95],
+                "gaussian_noise_probability": [0.0, 0.25],
+                "gaussian_noise_std": [0.005, 0.025],
+                "blur_probability": [0.0, 0.10],
+                "sharpen_probability": [0.0, 0.10],
+            },
         },
-    }
-
-
-def sampling_curriculum_config(args):
-    return {
-        "enabled": args.label_cardinality_curriculum,
-        "groups": list(CURRICULUM_GROUP_NAMES),
-        "start_probabilities": list(CURRICULUM_START_PROBABILITIES),
-        "final_probabilities": list(CURRICULUM_FINAL_PROBABILITIES),
-        "ramp_start_epoch": args.label_curriculum_ramp_start,
-        "ramp_end_epoch": args.label_curriculum_ramp_end,
-        "natural_sampling_after_ramp": True,
     }
 
 
@@ -428,7 +320,6 @@ def save_checkpoint(path, model, optimizer, scheduler, scaler, epoch, best_auc, 
         "epoch": epoch, "optimizer_step": scheduler.last_epoch,
         "best_macro_auc": best_auc, "class_names": list(CLASS_NAMES),
         "preprocessing": preprocessing_config(args), "architecture": architecture_config(args),
-        "sampling_curriculum": sampling_curriculum_config(args),
         "config": vars(args) | {"data_root": str(args.data_root), "output_dir": str(args.output_dir),
                                   "resume": str(args.resume) if args.resume else None},
         "torch_rng_state": torch.get_rng_state(), "python_rng_state": random.getstate(),
@@ -446,9 +337,6 @@ def restore_checkpoint(path, model, optimizer, scheduler, scaler, args):
         raise ValueError("checkpoint preprocessing differs from current arguments")
     if checkpoint.get("architecture") != architecture_config(args):
         raise ValueError("checkpoint architecture differs from current arguments")
-    saved_curriculum = checkpoint.get("sampling_curriculum")
-    if saved_curriculum is not None and saved_curriculum != sampling_curriculum_config(args):
-        raise ValueError("checkpoint sampling curriculum differs from current arguments")
     model.load_state_dict(checkpoint["model"])
     optimizer.load_state_dict(checkpoint["optimizer"])
     scheduler.load_state_dict(checkpoint["scheduler"])
@@ -473,13 +361,6 @@ def main(argv=None):
             raise ValueError("--augmentation-ramp-start must be non-negative")
         if args.augmentation_ramp_end <= args.augmentation_ramp_start:
             raise ValueError("--augmentation-ramp-end must be greater than ramp start")
-    if args.label_cardinality_curriculum:
-        if args.label_curriculum_ramp_start < 0:
-            raise ValueError("--label-curriculum-ramp-start must be non-negative")
-        if args.label_curriculum_ramp_end <= args.label_curriculum_ramp_start:
-            raise ValueError(
-                "--label-curriculum-ramp-end must be greater than ramp start"
-            )
     seed_everything(args.seed)
     device = torch.device("cuda" if args.device == "auto" and torch.cuda.is_available()
                           else "cpu" if args.device == "auto" else args.device)
@@ -498,7 +379,9 @@ def main(argv=None):
                               augment=True, max_studies=args.max_train_studies,
                               progressive_augment=args.progressive_augment,
                               augmentation_ramp_start=args.augmentation_ramp_start,
-                              augmentation_ramp_end=args.augmentation_ramp_end, **common)
+                              augmentation_ramp_end=args.augmentation_ramp_end,
+                              dynamic_imaging_augment=args.dynamic_imaging_augment,
+                              **common)
     train_eval_data = None
     if args.train_eval_interval:
         # This creates only a compact CSV index; image pixels are still loaded on demand.
@@ -510,17 +393,7 @@ def main(argv=None):
                               augment=False, max_studies=args.max_valid_studies, **common)
     loader_args = dict(batch_size=args.batch_size, num_workers=args.workers,
                        collate_fn=collate_studies, pin_memory=device.type == "cuda")
-    curriculum_sampler = None
-    if args.label_cardinality_curriculum:
-        curriculum_sampler = LabelCardinalityCurriculumSampler(
-            train_data, seed=args.seed,
-            ramp_start=args.label_curriculum_ramp_start,
-            ramp_end=args.label_curriculum_ramp_end,
-        )
-    train_loader = DataLoader(
-        train_data, shuffle=curriculum_sampler is None, sampler=curriculum_sampler,
-        **loader_args,
-    )
+    train_loader = DataLoader(train_data, shuffle=True, **loader_args)
     train_eval_loader = (
         DataLoader(train_eval_data, shuffle=False, **loader_args)
         if train_eval_data is not None else None
@@ -553,14 +426,12 @@ def main(argv=None):
                       "train_studies": len(train_data), "valid_studies": len(valid_data),
                       "local_tokens_per_image": 4 * args.local_token_grid ** 2,
                       "progressive_augment": args.progressive_augment,
+                      "dynamic_imaging_augment": args.dynamic_imaging_augment,
                       "augmentation_ramp": [args.augmentation_ramp_start,
-                                             args.augmentation_ramp_end],
-                      "sampling_curriculum": sampling_curriculum_config(args)}))
+                                             args.augmentation_ramp_end]}))
     for epoch in range(start_epoch, args.epochs + 1):
         epoch_started = time.perf_counter()
         train_data.set_epoch(epoch)
-        if curriculum_sampler is not None:
-            curriculum_sampler.set_epoch(epoch)
         augmentation_strength = train_data.augmentation_strength
         train_loss = train_epoch(
             model, train_loader, optimizer, scheduler, scaler, device, args
@@ -580,9 +451,6 @@ def main(argv=None):
             "learning_rate": scheduler.get_last_lr()[0],
             "train_loss": train_loss,
             "augmentation_strength": augmentation_strength,
-            **(curriculum_sampler.report() if curriculum_sampler is not None else {
-                "sampling_group_probabilities": {}, "sampled_group_counts": {},
-            }),
             **training_evaluation_report(train_eval_metrics),
             **metrics,
             "best_macro_auc": best_auc,
