@@ -135,6 +135,9 @@ def main():
     ap.add_argument("--bs", type=int, default=24)
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--wd", type=float, default=0.05)
+    ap.add_argument("--drop_path", type=float, default=0.1,
+                    help="backbone stochastic-depth rate (timm drop_path_rate)")
+    ap.add_argument("--drop_rate", type=float, default=0.2, help="分类头 dropout")
     ap.add_argument("--warmup", type=float, default=1.0, help="warmup epoch 数")
     ap.add_argument("--loss", default="asl", choices=["asl", "bce"])
     ap.add_argument("--hflip", type=float, default=0.5)
@@ -164,7 +167,8 @@ def main():
     dl_va = DataLoader(CXRDataset(va, args.img_size, False), batch_size=args.bs * 2, shuffle=False,
                        num_workers=args.workers, pin_memory=amp)
 
-    model = CXRNet(args.backbone, pretrained=not args.no_pretrained, pretrained_path=args.pretrained_path).to(device)
+    model = CXRNet(args.backbone, pretrained=not args.no_pretrained, pretrained_path=args.pretrained_path,
+                   drop_rate=args.drop_rate, drop_path_rate=args.drop_path).to(device)
     ema = EMA(model, args.ema) if args.ema > 0 else None
     crit = AsymmetricLoss() if args.loss == "asl" else nn.BCEWithLogitsLoss()
     head_params = list(model.head.parameters()) + [model.p]
@@ -176,7 +180,8 @@ def main():
     scaler = torch.cuda.amp.GradScaler(enabled=amp)
 
     cfg = dict(backbone=args.backbone, img_size=args.img_size, cache_size=cache_size,
-               epochs=args.epochs, agg=args.agg, merge_valid=args.merge_valid, seed=args.seed)
+               epochs=args.epochs, agg=args.agg, merge_valid=args.merge_valid, seed=args.seed,
+               lr=args.lr, drop_path=args.drop_path, drop_rate=args.drop_rate, loss=args.loss)
     if args.pretrained_path:
         cfg["pretrained_file"] = os.path.basename(args.pretrained_path)
     os.makedirs(args.out_dir, exist_ok=True)
@@ -206,7 +211,7 @@ def main():
         msg = dict(epoch=ep + 1, loss=run / max(1, steps_ep), time=round(time.time() - t0, 1))
         eval_model = model
         if ema:  # 用 EMA 权重评估/保存
-            eval_model = CXRNet(args.backbone, pretrained=False).to(device)
+            eval_model = CXRNet(args.backbone, pretrained=False, drop_path_rate=args.drop_path).to(device)
             ema.copy_to(eval_model)
         if not args.merge_valid:
             auc, aucs, f1, st, y = evaluate(eval_model, dl_va, va, device, amp, args.agg)

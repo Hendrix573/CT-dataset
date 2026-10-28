@@ -1,0 +1,52 @@
+{
+  "inference_total_mb": 186.54,
+  "limit_mb": 500,
+  "ok": true,
+  "files": [
+    {
+      "file": "model/cnx_s_512/best.pth",
+      "bytes": 99009449,
+      "sha256": "30f52b4a62fd4306d1defa1687a57130507f56dd4a53a42c45c7bdbaeb45d9c9",
+      "counted": true
+    },
+    {
+      "file": "model/cnx_t_512/best.pth",
+      "bytes": 55697619,
+      "sha256": "071576be4130dad2b1c3e62de8beac4e036e50bb4c8a5d8effaf34fba6429e39",
+      "counted": true
+    },
+    {
+      "file": "model/effv2s_512/best.pth",
+      "bytes": 40897243,
+      "sha256": "fed5d420231e58d448fe2ca577fafe0eac5281118143aca9848817f4b728f597",
+      "counted": true
+    },
+    {
+      "file": "model/thresholds.json",
+      "bytes": 339,
+      "sha256": "d011174ef6d305554143d9544b71f774feabf561c45e9ad30b79dbd842f8ebaa",
+      "counted": true
+    },
+    {
+      "file": "pretrain_model/convnext_small.fb_in22k_ft_in1k.safetensors",
+      "bytes": 200928946,
+      "sha256": "2457488bec2ffcb2061b9e3fdd63360114549615e3e35ef6dc5c5efe549cbbc9",
+      "counted": false,
+      "note": "预训练初始化权重，推理不加载"
+    },
+    {
+      "file": "pretrain_model/convnext_tiny.fb_in22k_ft_in1k.safetensors",
+      "bytes": 114374272,
+      "sha256": "77b619e187de71bce58721689da0c009e84cc20677293d7d43105307e34d868a",
+      "counted": false,
+      "note": "预训练初始化权重，推理不加载"
+    },
+    {
+      "file": "pretrain_model/tf_efficientnetv2_s.in21k_ft_in1k.safetensors",
+      "bytes": 86523256,
+      "sha256": "6f1933fb6c0d760eae03863ad0110570393e16c0610f8fe94dc9f978e52ec59c",
+      "counted": false,
+      "note": "预训练初始化权重，推理不加载"
+    }
+  ]
+}
