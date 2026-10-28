@@ -146,6 +146,9 @@ def main():
     ap.add_argument("--max_steps", type=int, default=0, help="冒烟测试：每 epoch 最多步数")
     args = ap.parse_args()
 
+    if args.no_pretrained and args.pretrained_path:
+        ap.error("--no_pretrained 与 --pretrained_path 不能同时使用")
+
     seed_everything(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     amp = device.type == "cuda"
@@ -174,6 +177,8 @@ def main():
 
     cfg = dict(backbone=args.backbone, img_size=args.img_size, cache_size=cache_size,
                epochs=args.epochs, agg=args.agg, merge_valid=args.merge_valid, seed=args.seed)
+    if args.pretrained_path:
+        cfg["pretrained_file"] = os.path.basename(args.pretrained_path)
     os.makedirs(args.out_dir, exist_ok=True)
     best, step, log = -1, 0, []
     for ep in range(args.epochs):

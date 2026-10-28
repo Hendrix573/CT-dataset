@@ -18,13 +18,13 @@ python preprocess.py --data_root $DATA --cache_dir $CACHE --cache_size $SIZE --w
 
 # 2) 阶段1：train 训练，valid 选最优 epoch，产出 valid 预测
 python train.py --cache_dir $CACHE/$SIZE --out_dir ../model/cnx_s_512 \
-  --backbone convnext_small.fb_in22k_ft_in1k --pretrained_path ../pretrain_model/convnext_small.fb_in22k_ft_in1k.pth \
+  --backbone convnext_small.fb_in22k_ft_in1k --pretrained_path ../pretrain_model/convnext_small.fb_in22k_ft_in1k.safetensors \
   --img_size 512 --epochs 20 --bs 24 --lr 1e-4 --workers $WORKERS --seed 42
 python train.py --cache_dir $CACHE/$SIZE --out_dir ../model/effv2s_512 \
-  --backbone tf_efficientnetv2_s.in21k_ft_in1k --pretrained_path ../pretrain_model/tf_efficientnetv2_s.in21k_ft_in1k.pth \
+  --backbone tf_efficientnetv2_s.in21k_ft_in1k --pretrained_path ../pretrain_model/tf_efficientnetv2_s.in21k_ft_in1k.safetensors \
   --img_size 512 --epochs 20 --bs 24 --lr 3e-4 --workers $WORKERS --seed 7
 python train.py --cache_dir $CACHE/$SIZE --out_dir ../model/cnx_t_512 \
-  --backbone convnext_tiny.fb_in22k_ft_in1k --pretrained_path ../pretrain_model/convnext_tiny.fb_in22k_ft_in1k.pth \
+  --backbone convnext_tiny.fb_in22k_ft_in1k --pretrained_path ../pretrain_model/convnext_tiny.fb_in22k_ft_in1k.safetensors \
   --img_size 512 --epochs 20 --bs 32 --lr 1.5e-4 --workers $WORKERS --seed 2024
 
 # 3) 用 valid 标定集成阈值（必须在任何“合并 valid 训练”之前完成）

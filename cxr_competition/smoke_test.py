@@ -6,10 +6,11 @@ import os
 import sys
 import shutil
 import subprocess
+import tempfile
 
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-TMP = "/tmp/cxr_smoke"
+TMP = os.path.join(tempfile.gettempdir(), "cxr_smoke")
 DATA = os.path.join(TMP, "cxr_first")
 PY = sys.executable
 
@@ -49,6 +50,36 @@ def run(cmd, cwd):
     subprocess.run(cmd, cwd=cwd, check=True)
 
 
+def check_local_pretrained():
+    """Verify that CXRNet really consumes a local safetensors checkpoint."""
+    import torch
+    import timm
+    from safetensors.torch import save_file
+
+    code = os.path.join(HERE, "code")
+    sys.path.insert(0, code)
+    from model import CXRNet
+
+    backbone = "mobilenetv3_small_050"
+    source = timm.create_model(backbone, pretrained=False)
+    state = {}
+    for key, value in source.state_dict().items():
+        tensor = value.detach().cpu().contiguous()
+        state[key] = torch.full_like(tensor, 0.125) if tensor.is_floating_point() else torch.zeros_like(tensor)
+    path = os.path.join(TMP, "local_pretrained.safetensors")
+    save_file(state, path)
+
+    model = CXRNet(backbone, pretrained_path=path)
+    loaded = model.backbone.state_dict()
+    candidates = [key for key, value in state.items()
+                  if key in loaded and value.is_floating_point() and value.ndim > 1
+                  and value.shape == loaded[key].shape]
+    assert candidates, "没有找到可比较的预训练参数"
+    key = candidates[-1]
+    assert torch.equal(loaded[key].cpu(), state[key]), f"本地预训练参数未加载: {key}"
+    print("local pretrained load check passed:", key, flush=True)
+
+
 def gen():
     shutil.rmtree(TMP, ignore_errors=True)
     rng = np.random.default_rng(0)
@@ -75,6 +106,7 @@ def check_submission():
 def main():
     # 父进程保持轻量（本机仅 1GB 内存），所有重活放子进程
     run([PY, __file__, "--gen"], HERE)
+    run([PY, __file__, "--check-pretrained"], HERE)
     code, md, cache = os.path.join(HERE, "code"), os.path.join(TMP, "model"), os.path.join(TMP, "cache")
     run([PY, "preprocess.py", "--data_root", DATA, "--cache_dir", cache, "--cache_size", "112", "--workers", "1"], code)
     for bb in ["mobilenetv3_small_050", "test_efficientnet"]:  # 本机 1GB 内存，仅用微型骨干验证流程
@@ -92,7 +124,9 @@ def main():
 
 
 if __name__ == "__main__":
-    if "--gen" in sys.argv or "--check" in sys.argv:
+    if "--check-pretrained" in sys.argv:
+        check_local_pretrained()
+    elif "--gen" in sys.argv or "--check" in sys.argv:
         import numpy as np
         import pandas as pd
         from PIL import Image

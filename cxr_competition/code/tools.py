@@ -31,12 +31,17 @@ def sha256(path, bs=1 << 20):
 
 def download(args):
     import timm
-    import torch
+    from safetensors.torch import save_file
     os.makedirs(args.out, exist_ok=True)
-    m = timm.create_model(args.backbone, pretrained=True)
+    path = os.path.join(args.out, args.backbone.replace("/", "_") + ".safetensors")
+    if os.path.isfile(path):
+        m = timm.create_model(args.backbone, pretrained=False)
+        print(f"reuse existing pretrained weights: {os.path.abspath(path)}")
+    else:
+        m = timm.create_model(args.backbone, pretrained=True)
+        state_dict = {k: v.detach().cpu().contiguous() for k, v in m.state_dict().items()}
+        save_file(state_dict, path)
     cfg = m.pretrained_cfg
-    path = os.path.join(args.out, args.backbone.replace("/", "_") + ".pth")
-    torch.save(m.state_dict(), path)
     fam = next((k for k in LICENSES if args.backbone.startswith(k)), None)
     info = dict(backbone=args.backbone, file=os.path.basename(path), sha256=sha256(path),
                 hf_hub_id=cfg.get("hf_hub_id"), url=f"https://huggingface.co/{cfg.get('hf_hub_id')}",

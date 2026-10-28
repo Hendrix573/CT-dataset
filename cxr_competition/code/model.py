@@ -20,8 +20,12 @@ class CXRNet(nn.Module):
         kw = dict(pretrained=pretrained, in_chans=1, num_classes=0, global_pool="",
                   drop_path_rate=drop_path_rate)
         if pretrained_path:  # 离线权重（提交包 pretrain_model/ 下）；timm 自动把 RGB 首层卷积合并为单通道
+            pretrained_path = os.path.abspath(os.path.expanduser(pretrained_path))
+            if not os.path.isfile(pretrained_path):
+                raise FileNotFoundError(f"预训练权重不存在: {pretrained_path}")
             kw["pretrained"] = True
             kw["pretrained_cfg_overlay"] = dict(file=pretrained_path)
+            print(f"loading local pretrained weights: {pretrained_path}", flush=True)
         try:
             self.backbone = timm.create_model(backbone, **kw)
         except TypeError:  # 部分模型不支持 drop_path_rate
