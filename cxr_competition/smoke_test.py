@@ -7,6 +7,7 @@ import sys
 import shutil
 import subprocess
 import tempfile
+import importlib.metadata
 
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -48,6 +49,36 @@ def make_split(split, n_study, start, rng, labeled=True):
 def run(cmd, cwd):
     print("\n$", " ".join(cmd), flush=True)
     subprocess.run(cmd, cwd=cwd, check=True)
+
+
+def check_environment():
+    """Fail early with an actionable message when OpenCV wheels are mixed."""
+    flavors = ("opencv-python", "opencv-contrib-python",
+               "opencv-python-headless", "opencv-contrib-python-headless")
+    installed = {}
+    for dist in importlib.metadata.distributions():
+        name = dist.metadata.get("Name", "").lower()
+        if name in flavors:
+            installed[name] = dist.version
+    print("installed OpenCV packages:", installed or "none", flush=True)
+    if len(installed) > 1:
+        print("WARNING: multiple OpenCV wheels share the cv2 namespace; keep only opencv-python-headless.",
+              flush=True)
+    try:
+        import cv2
+        assert hasattr(cv2.dnn, "DictValue"), "cv2.dnn.DictValue is missing"
+    except Exception as exc:
+        command = (
+            f"{PY} -m pip uninstall -y opencv-python opencv-contrib-python "
+            "opencv-python-headless opencv-contrib-python-headless\n"
+            f"{PY} -m pip install --no-cache-dir --force-reinstall "
+            "'numpy>=1.24,<2' 'opencv-python-headless==4.10.0.84'"
+        )
+        raise RuntimeError(
+            f"OpenCV environment is inconsistent: {exc}\n"
+            "Run these commands, then rerun the smoke test:\n" + command
+        ) from exc
+    print(f"OpenCV import check passed: version={cv2.__version__} file={cv2.__file__}", flush=True)
 
 
 def check_local_pretrained():
@@ -105,6 +136,7 @@ def check_submission():
 
 def main():
     # 父进程保持轻量（本机仅 1GB 内存），所有重活放子进程
+    run([PY, __file__, "--check-env"], HERE)
     run([PY, __file__, "--gen"], HERE)
     run([PY, __file__, "--check-pretrained"], HERE)
     code, md, cache = os.path.join(HERE, "code"), os.path.join(TMP, "model"), os.path.join(TMP, "cache")
@@ -124,7 +156,9 @@ def main():
 
 
 if __name__ == "__main__":
-    if "--check-pretrained" in sys.argv:
+    if "--check-env" in sys.argv:
+        check_environment()
+    elif "--check-pretrained" in sys.argv:
         check_local_pretrained()
     elif "--gen" in sys.argv or "--check" in sys.argv:
         import numpy as np
