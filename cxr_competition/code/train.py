@@ -156,7 +156,9 @@ def main():
     ap.add_argument("--meta_drop", type=float, default=0.1)
     ap.add_argument("--agg", default="meanmax", choices=["mean", "max", "meanmax"])
     ap.add_argument("--frontal_w", type=float, default=1.0)
-    ap.add_argument("--merge_valid", action="store_true", help="旧模式阶段2：train+valid 固定 epochs")
+    ap.add_argument("--merge_valid", action="store_true", help="全量模式：train+valid 合并，固定轮数，无验证")
+    ap.add_argument("--stop_epoch", type=int, default=0,
+                    help="全量模式：学习率仍按 --epochs 的余弦计划，在第 stop_epoch 轮保存并停止（复现折实验最佳轮）")
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--max_steps", type=int, default=0, help="冒烟测试：每 epoch 最多步数")
@@ -246,12 +248,16 @@ def main():
                 np.save(os.path.join(args.out_dir, "valid_study_labels.npy"), y)
                 msg["saved"] = True
                 msg["per_class_auc"] = [round(a, 4) for a in aucs]
-        elif ep == args.epochs - 1:
-            save_checkpoint(eval_model, cfg, args.out_dir)
+        elif ep + 1 == (args.stop_epoch or args.epochs):
+            save_checkpoint(eval_model, {**cfg, "best_epoch": ep + 1, "stop_epoch": args.stop_epoch}, args.out_dir)
             msg["saved"] = True
+        if not np.isfinite(msg["loss"]):
+            raise SystemExit(f"loss 非有限值: {msg}")
         print(msg, flush=True)
         log.append(msg)
         save_json(log, os.path.join(args.out_dir, "train_log.json"))
+        if args.merge_valid and args.stop_epoch and ep + 1 >= args.stop_epoch:
+            break
 
     if holdout is not None:  # 用 best 权重预测官方验证集（仅留出评估）
         bm, _ = load_model(os.path.join(args.out_dir, "best.pth"), device)
