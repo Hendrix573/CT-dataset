@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""公共工具：标签解析、图像索引、确定性图像读取、指标、阈值重映射、检查级聚合。
+"""公共工具：标签解析、图像索引、确定性读图、视角元数据编码、指标、阈值重映射、检查级聚合。
 训练 / 推理 / 计时脚本共用同一套函数，保证预处理完全一致。"""
 import os
 import glob
@@ -17,6 +17,7 @@ CLASS_NAMES = [
     "Edema", "Cardiomegaly", "Atelectasis", "Lung Opacity", "Pleural Effusion",
     "No Finding",
 ]
+PCOLS = [f"p{k}" for k in range(1, NUM_CLASSES + 1)]
 IMG_EXTS = (".jpg", ".jpeg", ".png", ".bmp")
 
 cv2.setNumThreads(1)
@@ -45,9 +46,56 @@ def parse_labels(s):
     return y
 
 
+# ----------------------------------------------------------------- P2: 视角元数据（逐图自带信息，非跨样本统计）
+VIEWS = ["PA", "AP", "LAT", "OTHER", "MISSING"]
+ORIENTS = ["Erect", "Recumbent", "MISSING"]
+META_DIM = len(VIEWS) + len(ORIENTS)
+
+
+def _blank(v):
+    return v is None or (isinstance(v, float) and np.isnan(v)) or str(v).strip() == "" or str(v).lower() == "nan"
+
+
+def view_cat(v):
+    if _blank(v):
+        return "MISSING"
+    u = str(v).upper().strip()
+    if "LAT" in u or u in ("LL", "RL", "LLD", "RLD"):
+        return "LAT"
+    if u.startswith("PA"):
+        return "PA"
+    if u.startswith("AP"):
+        return "AP"
+    return "OTHER"
+
+
+def orient_cat(o):
+    if _blank(o):
+        return "MISSING"
+    s = str(o).lower().strip()
+    if s.startswith("erect") or s.startswith("upright") or s.startswith("stand"):
+        return "Erect"
+    if s.startswith("recumb") or s.startswith("supine") or s.startswith("lying"):
+        return "Recumbent"
+    return "MISSING"
+
+
+def meta_vector(view, orient):
+    m = np.zeros(META_DIM, dtype=np.float32)
+    m[VIEWS.index(view_cat(view))] = 1.0
+    m[len(VIEWS) + ORIENTS.index(orient_cat(orient))] = 1.0
+    return m
+
+
+MISSING_META = meta_vector(None, None)
+
+
+def is_frontal(view):
+    return view_cat(view) in ("PA", "AP")
+
+
 # ----------------------------------------------------------------- image index
 def build_image_index(split_dir):
-    """递归扫描目录 -> {文件名(无扩展名): 路径}。兼容 pic_xxx / image_xxx 命名。"""
     idx = {}
     for p in glob.glob(os.path.join(split_dir, "**", "*"), recursive=True):
         if p.lower().endswith(IMG_EXTS):
@@ -95,11 +143,10 @@ def scan_folder(folder):
 
 # ----------------------------------------------------------------- image IO
 def load_gray(path, cache_size):
-    """确定性读取：JPEG 用 DCT 域降采样 (draft) 加速大图解码，再 INTER_AREA 缩放到 cache_size 方图。
-    训练缓存与推理都调用本函数，保证像素级一致。"""
+    """确定性读取：JPEG 用 DCT 域降采样 (draft) 加速大图解码，再 INTER_AREA 缩放到 cache_size 方图。"""
     with Image.open(path) as im:
         if im.format == "JPEG":
-            im.draft("L", (cache_size, cache_size))  # 只会缩小到 >= 目标尺寸
+            im.draft("L", (cache_size, cache_size))
         im = im.convert("L")
         arr = np.asarray(im)
     if arr.dtype != np.uint8:
@@ -108,7 +155,7 @@ def load_gray(path, cache_size):
 
 
 def to_model_input(gray, img_size):
-    """uint8 方图 -> float32 (1,H,W)，单图自身 [0,1] 归一化 + 固定 ImageNet 灰度均值方差（规则允许）。"""
+    """uint8 方图 -> float32 (1,H,W)，固定 ImageNet 灰度均值方差（不依赖任何数据集统计）。"""
     if gray.shape[0] != img_size:
         gray = cv2.resize(gray, (img_size, img_size), interpolation=cv2.INTER_AREA)
     x = gray.astype(np.float32) / 255.0
@@ -116,9 +163,8 @@ def to_model_input(gray, img_size):
     return x[None]
 
 
-# ----------------------------------------------------------------- metrics
+# ----------------------------------------------------------------- metrics（纯 numpy，与 sklearn 一致）
 def _auc(y, s):
-    """二分类 ROC-AUC（Mann-Whitney 秩统计，并列取平均秩），与 sklearn.roc_auc_score 一致，免去 sklearn 依赖。"""
     y = np.asarray(y).astype(bool)
     r = pd.Series(np.asarray(s, dtype=np.float64)).rank(method="average").values
     npos, nneg = y.sum(), (~y).sum()
@@ -144,14 +190,12 @@ def macro_f1(y, p, thr=0.5):
 
 
 def best_thresholds(y, p):
-    """逐类在验证集上搜索 F1 最优阈值。"""
     grid = np.linspace(0.02, 0.98, 97)
     return [float(grid[int(np.argmax([_f1(y[:, k], p[:, k] >= t) for t in grid]))]) for k in range(y.shape[1])]
 
 
 def remap_probs(p, thr):
-    """分段线性单调重映射：把类别最优阈值 t 映射到 0.5。
-    单调变换不改变 AUC（主指标），但让主办方默认 0.5 阈值下的 F1（副指标）达到验证集最优。"""
+    """分段线性单调重映射：类别最优阈值 t -> 0.5。AUC 不变，0.5 阈值下 F1 达到标定集最优。"""
     p = np.asarray(p, dtype=np.float64)
     t = np.clip(np.asarray(thr, dtype=np.float64), 1e-3, 1 - 1e-3)
     lo = 0.5 * p / t
@@ -159,23 +203,36 @@ def remap_probs(p, thr):
     return np.clip(np.where(p < t, lo, hi), 0.0, 1.0)
 
 
-# ----------------------------------------------------------------- study aggregation
-def aggregate_study(probs, mode="meanmax"):
-    """同一次检查多张图 -> 检查级概率（确定性聚合，规则允许）。"""
+# ----------------------------------------------------------------- study aggregation（确定性，规则允许）
+def aggregate_study(probs, mode="meanmax", views=None, frontal_w=1.0):
+    """同一检查多张图 -> 检查级概率。frontal_w>1 时正位片(PA/AP)在均值中权重更高。"""
     probs = np.asarray(probs, dtype=np.float64)
+    if views is None or frontal_w == 1.0:
+        w = np.ones(len(probs))
+    else:
+        w = np.array([frontal_w if is_frontal(v) else 1.0 for v in views])
+    wmean = (probs * w[:, None]).sum(0) / w.sum()
     if mode == "mean":
-        return probs.mean(0)
+        return wmean
     if mode == "max":
         return probs.max(0)
-    return 0.5 * probs.mean(0) + 0.5 * probs.max(0)
+    return 0.5 * wmean + 0.5 * probs.max(0)
 
 
-def aggregate_df(img_df, prob_cols, mode="meanmax"):
-    """img_df 含 Subject_id, Study_id 及概率列 -> 检查级 DataFrame（保持首次出现顺序）"""
+def aggregate_df(img_df, prob_cols=PCOLS, mode="meanmax", frontal_w=1.0):
+    """img_df 含 Subject_id, Study_id, 概率列，可选 ViewPosition -> 检查级 DataFrame（保持首次出现顺序）"""
+    has_view = "ViewPosition" in img_df.columns
     out = []
     for (sub, stu), g in img_df.groupby(["Subject_id", "Study_id"], sort=False):
-        out.append([sub, stu, *aggregate_study(g[prob_cols].values, mode)])
+        views = g["ViewPosition"].values if has_view else None
+        out.append([sub, stu, *aggregate_study(g[prob_cols].values, mode, views, frontal_w)])
     return pd.DataFrame(out, columns=["Subject_id", "Study_id", *prob_cols])
+
+
+def study_labels(img_df):
+    """img_df 含 Predict_class -> 与 aggregate_df 同顺序的 (N,10) 标签矩阵"""
+    lab = img_df.groupby(["Subject_id", "Study_id"], sort=False).Predict_class.first()
+    return np.stack([parse_labels(s) for s in lab.values])
 
 
 def save_json(obj, path):

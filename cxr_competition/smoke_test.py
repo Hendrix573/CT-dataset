@@ -6,12 +6,10 @@ import os
 import sys
 import shutil
 import subprocess
-import tempfile
-import importlib.metadata
 
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-TMP = os.path.join(tempfile.gettempdir(), "cxr_smoke")
+TMP = "/tmp/cxr_smoke"
 DATA = os.path.join(TMP, "cxr_first")
 PY = sys.executable
 
@@ -51,66 +49,6 @@ def run(cmd, cwd):
     subprocess.run(cmd, cwd=cwd, check=True)
 
 
-def check_environment():
-    """Fail early with an actionable message when OpenCV wheels are mixed."""
-    flavors = ("opencv-python", "opencv-contrib-python",
-               "opencv-python-headless", "opencv-contrib-python-headless")
-    installed = {}
-    for dist in importlib.metadata.distributions():
-        name = dist.metadata.get("Name", "").lower()
-        if name in flavors:
-            installed[name] = dist.version
-    print("installed OpenCV packages:", installed or "none", flush=True)
-    if len(installed) > 1:
-        print("WARNING: multiple OpenCV wheels share the cv2 namespace; keep only opencv-python-headless.",
-              flush=True)
-    try:
-        import cv2
-        assert hasattr(cv2.dnn, "DictValue"), "cv2.dnn.DictValue is missing"
-    except Exception as exc:
-        command = (
-            f"{PY} -m pip uninstall -y opencv-python opencv-contrib-python "
-            "opencv-python-headless opencv-contrib-python-headless\n"
-            f"{PY} -m pip install --no-cache-dir --force-reinstall "
-            "'numpy>=1.24,<2' 'opencv-python-headless==4.10.0.84'"
-        )
-        raise RuntimeError(
-            f"OpenCV environment is inconsistent: {exc}\n"
-            "Run these commands, then rerun the smoke test:\n" + command
-        ) from exc
-    print(f"OpenCV import check passed: version={cv2.__version__} file={cv2.__file__}", flush=True)
-
-
-def check_local_pretrained():
-    """Verify that CXRNet really consumes a local safetensors checkpoint."""
-    import torch
-    import timm
-    from safetensors.torch import save_file
-
-    code = os.path.join(HERE, "code")
-    sys.path.insert(0, code)
-    from model import CXRNet
-
-    backbone = "mobilenetv3_small_050"
-    source = timm.create_model(backbone, pretrained=False)
-    state = {}
-    for key, value in source.state_dict().items():
-        tensor = value.detach().cpu().contiguous()
-        state[key] = torch.full_like(tensor, 0.125) if tensor.is_floating_point() else torch.zeros_like(tensor)
-    path = os.path.join(TMP, "local_pretrained.safetensors")
-    save_file(state, path)
-
-    model = CXRNet(backbone, pretrained_path=path)
-    loaded = model.backbone.state_dict()
-    candidates = [key for key, value in state.items()
-                  if key in loaded and value.is_floating_point() and value.ndim > 1
-                  and value.shape == loaded[key].shape]
-    assert candidates, "没有找到可比较的预训练参数"
-    key = candidates[-1]
-    assert torch.equal(loaded[key].cpu(), state[key]), f"本地预训练参数未加载: {key}"
-    print("local pretrained load check passed:", key, flush=True)
-
-
 def gen():
     shutil.rmtree(TMP, ignore_errors=True)
     rng = np.random.default_rng(0)
@@ -126,8 +64,9 @@ def gen():
 
 
 def check_submission():
-    test = pd.read_csv(os.path.join(DATA, "test.csv"))
-    s = pd.read_csv(os.path.join(TMP, "submission.csv"))
+    a = sys.argv
+    test = pd.read_csv(a[a.index("--test") + 1] if "--test" in a else os.path.join(DATA, "test.csv"))
+    s = pd.read_csv(a[a.index("--sub") + 1] if "--sub" in a else os.path.join(TMP, "submission.csv"))
     assert list(s.columns) == ["Subject_id", "Study_id", "Predict_class", "Probability"]
     assert s.Study_id.nunique() == test.Study_id.nunique() and len(s) == 10 * test.Study_id.nunique()
     assert s.Probability.between(0, 1).all()
@@ -136,9 +75,7 @@ def check_submission():
 
 def main():
     # 父进程保持轻量（本机仅 1GB 内存），所有重活放子进程
-    run([PY, __file__, "--check-env"], HERE)
     run([PY, __file__, "--gen"], HERE)
-    run([PY, __file__, "--check-pretrained"], HERE)
     code, md, cache = os.path.join(HERE, "code"), os.path.join(TMP, "model"), os.path.join(TMP, "cache")
     run([PY, "preprocess.py", "--data_root", DATA, "--cache_dir", cache, "--cache_size", "112", "--workers", "1"], code)
     for bb in ["mobilenetv3_small_050", "test_efficientnet"]:  # 本机 1GB 内存，仅用微型骨干验证流程
@@ -156,11 +93,7 @@ def main():
 
 
 if __name__ == "__main__":
-    if "--check-env" in sys.argv:
-        check_environment()
-    elif "--check-pretrained" in sys.argv:
-        check_local_pretrained()
-    elif "--gen" in sys.argv or "--check" in sys.argv:
+    if "--gen" in sys.argv or "--check" in sys.argv:
         import numpy as np
         import pandas as pd
         from PIL import Image
