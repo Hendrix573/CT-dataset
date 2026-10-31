@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
 # P1 自动调参（断点续跑：已完成的实验自动跳过）
+#  R1 EffV2-S: epochs x lr
+#  R2 EffV2-S: drop_path x weight_decay
+#  R3 EffV2-S: BCE / 关闭翻转 / 多训2轮
+#  R4 ConvNeXt-S、ConvNeXt-T 继承最优配置，各试 2 个 lr
+#  R5 各骨干最优 -> model_p1/ -> 集成子集选择 -> 阈值标定 -> 预测 -> 清单 -> 耗时
+# 产物在 exp/ model_p1/ output_p1/，不覆盖现有 model/ 和 submission.csv
 set -uo pipefail
 cd "$(dirname "$0")/code"
 mkdir -p ../exp ../logs
@@ -29,35 +35,35 @@ run() {  # run <arch> <epochs> <lr> <drop_path> <wd> <loss> <hflip>
 }
 best() { python ../p1_tools.py best "$1"; }
 
-# R1：epochs × lr（drop_path 0.3, wd 0.05, ASL, 翻转 0.5）
+# ---------------- R1：epochs x lr（drop_path 0.3, wd 0.05, ASL, 翻转 0.5）
 for EP in 8 10 12; do for LR in 1e-4 1.5e-4 3e-4; do
   run eff $EP $LR 0.3 0.05 asl 0.5
 done; done
 read A EP LR DP WD LOSS HF TAG AUC BEP <<< "$(best eff)"
 echo "==> R1 最优: $TAG  AUC=$AUC  best_ep=$BEP"
 
-# R2：drop_path × wd
+# ---------------- R2：drop_path x wd
 for D in 0.2 0.3 0.4; do for W in 0.05 0.1; do
   run eff $EP $LR $D $W asl 0.5
 done; done
 read A EP LR DP WD LOSS HF TAG AUC BEP <<< "$(best eff)"
 echo "==> R2 最优: $TAG  AUC=$AUC  best_ep=$BEP"
 
-# R3：损失 / 翻转 / 训练长度
+# ---------------- R3：损失 / 翻转 / 训练长度
 run eff $EP $LR $DP $WD bce 0.5
 run eff $EP $LR $DP $WD asl 0.0
 run eff $((EP + 2)) $LR $DP $WD asl 0.5
 read A EP LR DP WD LOSS HF TAG AUC BEP <<< "$(best eff)"
 echo "==> EffV2-S 最终最优: $TAG  AUC=$AUC  best_ep=$BEP"
 
-# R4：ConvNeXt 继承 epochs / drop_path / wd / loss / hflip
+# ---------------- R4：ConvNeXt 继承 epochs / drop_path / wd / loss / hflip
 for L in 5e-5 1e-4;     do run cnxs $EP $L $DP $WD $LOSS $HF; done
 for L in 7.5e-5 1.5e-4; do run cnxt $EP $L $DP $WD $LOSS $HF; done
 
 echo; echo "================ 全部实验排行 ================"
 python ../p1_tools.py table
 
-# R5：组装 model_p1 -> 子集选择 -> 标定 -> 预测
+# ---------------- R5：组装 model_p1 -> 子集选择 -> 标定 -> 预测
 rm -rf ../model_p1 && mkdir -p ../model_p1
 for a in eff cnxs cnxt; do
   LINE=$(best $a) || continue

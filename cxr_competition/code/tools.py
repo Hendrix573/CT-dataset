@@ -31,17 +31,12 @@ def sha256(path, bs=1 << 20):
 
 def download(args):
     import timm
-    from safetensors.torch import save_file
+    import torch
     os.makedirs(args.out, exist_ok=True)
-    path = os.path.join(args.out, args.backbone.replace("/", "_") + ".safetensors")
-    if os.path.isfile(path):
-        m = timm.create_model(args.backbone, pretrained=False)
-        print(f"reuse existing pretrained weights: {os.path.abspath(path)}")
-    else:
-        m = timm.create_model(args.backbone, pretrained=True)
-        state_dict = {k: v.detach().cpu().contiguous() for k, v in m.state_dict().items()}
-        save_file(state_dict, path)
+    m = timm.create_model(args.backbone, pretrained=True)
     cfg = m.pretrained_cfg
+    path = os.path.join(args.out, args.backbone.replace("/", "_") + ".pth")
+    torch.save(m.state_dict(), path)
     fam = next((k for k in LICENSES if args.backbone.startswith(k)), None)
     info = dict(backbone=args.backbone, file=os.path.basename(path), sha256=sha256(path),
                 hf_hub_id=cfg.get("hf_hub_id"), url=f"https://huggingface.co/{cfg.get('hf_hub_id')}",
@@ -49,6 +44,18 @@ def download(args):
                 pretrain_data=LICENSES[fam][1] if fam else "请核对 model card",
                 paper=cfg.get("paper_ids"))
     save_json(info, path + ".json")
+    print(info)
+
+
+def register(args):
+    """离线模式：对已手动下载的权重文件计算 SHA-256，并记录来源链接/许可证（不联网）"""
+    fam = next((k for k in LICENSES if args.backbone.startswith(k)), None)
+    info = dict(backbone=args.backbone, file=os.path.basename(args.file), sha256=sha256(args.file),
+                hf_hub_id=f"timm/{args.backbone}", url=f"https://huggingface.co/timm/{args.backbone}",
+                download_url=f"https://huggingface.co/timm/{args.backbone}/resolve/main/model.safetensors",
+                license=LICENSES[fam][0] if fam else "请核对 model card",
+                pretrain_data=LICENSES[fam][1] if fam else "请核对 model card")
+    save_json(info, args.file + ".json")
     print(info)
 
 
@@ -78,9 +85,12 @@ if __name__ == "__main__":
     a = sp.add_parser("download")
     a.add_argument("--backbone", required=True)
     a.add_argument("--out", default="../pretrain_model")
+    c = sp.add_parser("register")
+    c.add_argument("--backbone", required=True)
+    c.add_argument("--file", required=True)
     b = sp.add_parser("manifest")
     b.add_argument("--model_dir", default="../model")
     b.add_argument("--pretrain_dir", default="../pretrain_model")
     args = ap.parse_args()
-    {"download": download, "manifest": manifest}[args.cmd](args)
+    {"download": download, "register": register, "manifest": manifest}[args.cmd](args)
     sys.exit(0)

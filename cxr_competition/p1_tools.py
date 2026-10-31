@@ -1,11 +1,20 @@
 # -*- coding: utf-8 -*-
 """P1 调参辅助：读取 exp/*/train_log.json + params.txt
-  python p1_tools.py show <tag> | best <arch> | table | subset <model_dir>"""
-import os, sys, json, glob, itertools
+  python p1_tools.py show <tag>          打印该实验最佳 val_auc
+  python p1_tools.py best <arch>         输出该骨干最优实验: a ep lr dp wd loss hf tag auc best_ep
+  python p1_tools.py table               全部实验排行
+  python p1_tools.py subset <model_dir>  验证集上比较集成子集，最后一行输出 KEEP 名单"""
+import os
+import sys
+import json
+import glob
+import itertools
+
 import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 EXP = os.path.join(HERE, "exp")
+
 
 def load(tag):
     d = os.path.join(EXP, tag)
@@ -15,6 +24,7 @@ def load(tag):
     i = int(np.argmax(aucs))
     return dict(tag=tag, params=params, auc=aucs[i], best_ep=i + 1, n_ep=len(log),
                 done=os.path.exists(os.path.join(d, "DONE")))
+
 
 def runs(prefix=""):
     out = []
@@ -26,6 +36,7 @@ def runs(prefix=""):
         except Exception:
             pass
     return out
+
 
 def main():
     cmd = sys.argv[1]
@@ -57,9 +68,10 @@ def main():
             for c in itertools.combinations(names, k):
                 a = macro_auc(y, np.mean([P[n] for n in c], 0))[0]
                 print(f"  {list(c)}: {a:.4f}")
-                if a > best[0] + 0.001:   # 子集须明显优于全集才采用，避免对验证集过拟合
+                if a > best[0] + 0.001:  # 子集须明显优于全集才采用，避免对验证集过拟合
                     best = (a, c)
         print("KEEP", " ".join(best[1]))
+
 
 if __name__ == "__main__":
     main()

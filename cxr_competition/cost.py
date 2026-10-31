@@ -31,7 +31,8 @@ def same(a, b):
     a, b = np.asarray(a, float), np.asarray(b, float)
     if np.max(np.abs(a - b)) > TOL:
         return False
-    if not np.array_equal(a >= 0.5, b >= 0.5):
+    flip = (a >= 0.5) != (b >= 0.5)          # 0.5 判定不同；两边都贴着 0.5（<1e-5，仅 6 位小数舍入造成）时不算不一致
+    if np.any(flip & ~((np.abs(a - 0.5) <= 1e-5) & (np.abs(b - 0.5) <= 1e-5))):
         return False
     for i in range(len(a)):
         for j in range(len(a)):
